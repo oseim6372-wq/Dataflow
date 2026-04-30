@@ -1,6 +1,6 @@
 {
   "name": "dataflow-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "DataFlow data reselling backend with HubnetGH API integration",
   "main": "server.js",
   "scripts": {
