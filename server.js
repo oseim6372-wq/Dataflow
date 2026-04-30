@@ -14,7 +14,7 @@ const PORT = process.env.PORT || 3000;
 const HUBNETGH_API_URL = process.env.HUBNETGH_API_URL || 'https://hubnetgh.site/wp-json/hubnet-api/v1';
 const HUBNETGH_API_KEY = process.env.HUBNETGH_API_KEY || '';
 const PAYSTACK_SECRET   = process.env.PAYSTACK_SECRET || '';
-const SELF_URL          = process.env.SELF_URL || `http://localhost:${PORT}`;
+const SELF_URL          = process.env.SELF_URL || `https://dataflow-2-0.onrender.com`;
 const DELIVER_SECRET    = process.env.DELIVER_SECRET || '';
 
 // In-memory dedup set (resets on server restart)
@@ -34,12 +34,39 @@ app.post('/paystack-webhook', express.raw({ type: 'application/json' }), handleP
 app.post('/webhook/paystack', express.raw({ type: 'application/json' }), handlePaystackWebhook);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'] }));
+app.use(cors({ 
+  origin: '*', 
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'X-API-KEY', 'X-Paystack-Signature']
+}));
 
 // Request logging
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
   next();
+});
+
+// ─────────────────────────────────────────────
+//  ROOT ROUTE - Fixes 404 on base URL
+// ─────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    name: 'DataFlow Backend API',
+    version: '2.0.0',
+    provider: 'HubnetGH',
+    timestamp: new Date().toISOString(),
+    endpoints: {
+      health: 'GET /health',
+      balance: 'GET /api/balance',
+      bundles: 'GET /api/bundles?network=mtn',
+      checkPrice: 'POST /api/check-price',
+      deliver: 'POST /deliver (requires API key)',
+      orderStatus: 'GET /api/order-status/:orderId',
+      webhook: 'POST /paystack-webhook'
+    },
+    docs: 'Contact support for API documentation'
+  });
 });
 
 // ─────────────────────────────────────────────
@@ -279,9 +306,11 @@ app.get('/health', (req, res) => {
     status: 'OK',
     timestamp: new Date().toISOString(),
     apiProvider: 'HubnetGH',
+    backendUrl: SELF_URL,
     hubnetghConfigured: !!HUBNETGH_API_KEY && HUBNETGH_API_KEY !== '',
     paystackConfigured: !!PAYSTACK_SECRET && PAYSTACK_SECRET !== '',
     deliverProtected:   !!DELIVER_SECRET && DELIVER_SECRET !== '',
+    uptime: process.uptime(),
     endpoints: ['/deliver', '/api/balance', '/api/order-status/:id', '/paystack-webhook', '/api/bundles', '/api/orders']
   });
 });
@@ -486,7 +515,11 @@ app.get('/api/orders', async (req, res) => {
 
 // 404 handler
 app.use((req, res) => {
-  res.status(404).json({ status: 'error', message: `Route ${req.method} ${req.url} not found` });
+  res.status(404).json({ 
+    status: 'error', 
+    message: `Route ${req.method} ${req.url} not found`,
+    availableEndpoints: ['/', '/health', '/api/balance', '/api/bundles', '/api/check-price', '/deliver', '/api/order-status/:id', '/paystack-webhook']
+  });
 });
 
 // Error handler
@@ -512,6 +545,7 @@ app.listen(PORT, () => {
 ║   🔒 /deliver key:  ${DELIVER_SECRET ? '✅ Configured' : '❌ NOT SET'}                      ║
 ║                                                                      ║
 ║   📮 Endpoints:                                                      ║
+║      GET  /                       → API information                  ║
 ║      POST /deliver                → Place order with HubnetGH 🔒     ║
 ║      GET  /api/balance            → HubnetGH wallet balance          ║
 ║      GET  /api/order-status/:id   → Check order status ✓             ║
