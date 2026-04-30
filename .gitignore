@@ -1,0 +1,78 @@
+# ─── Environment Variables ───
+.env
+.env.local
+.env.*.local
+
+# ─── Node Modules ───
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# ─── Runtime Data ───
+logs/
+*.log
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# ─── OS Files ───
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ─── Editor Files ───
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ─── Build Outputs ───
+dist/
+build/
+out/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# ─── Temporary Files ───
+*.tmp
+*.temp
+.cache/
+.temp/
+
+# ─── Backup Files ───
+*.bak
+*.backup
+*.old
+*.orig
+
+# ─── Testing ───
+coverage/
+.nyc_output/
+
+# ─── Misc ───
+*.7z
+*.rar
+*.zip
+*.tar
+*.gz
+
+# ─── PM2 / Process Manager ───
+.pm2/
+pm2.log
+pm2-error.log
