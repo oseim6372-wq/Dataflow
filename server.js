@@ -21,6 +21,7 @@ const DELIVER_SECRET    = process.env.DELIVER_SECRET || '';
 const processedRefs = new Set();
 
 // Bundle pricing (matching HubnetGH available volumes)
+// HubnetGH supported networks: mtn, airteltigo, telecel
 const BUNDLE_PRICES = {
   mtn: { "1": 12, "2": 18, "5": 35, "10": 60, "20": 110, "50": 250 },
   telecel: { "1": 12, "2": 18, "5": 35, "10": 60, "20": 110, "50": 250 },
@@ -37,7 +38,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use(cors({ 
   origin: '*', 
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'X-API-KEY', 'X-Paystack-Signature']
+  allowedHeaders: ['Content-Type', 'X-API-KEY', 'X-Paystack-Signature', 'x-api-key']
 }));
 
 // Request logging
@@ -47,25 +48,25 @@ app.use((req, res, next) => {
 });
 
 // ─────────────────────────────────────────────
-//  ROOT ROUTE - Fixes 404 on base URL
+//  ROOT ROUTE
 // ─────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
     name: 'DataFlow Backend API',
-    version: '2.0.0',
+    version: '2.0.1',
     provider: 'HubnetGH',
+    hubnetghUrl: HUBNETGH_API_URL,
     timestamp: new Date().toISOString(),
     endpoints: {
       health: 'GET /health',
       balance: 'GET /api/balance',
       bundles: 'GET /api/bundles?network=mtn',
       checkPrice: 'POST /api/check-price',
-      deliver: 'POST /deliver (requires API key)',
+      deliver: 'POST /deliver (requires x-api-key header)',
       orderStatus: 'GET /api/order-status/:orderId',
       webhook: 'POST /paystack-webhook'
-    },
-    docs: 'Contact support for API documentation'
+    }
   });
 });
 
@@ -75,12 +76,16 @@ app.get('/', (req, res) => {
 function requireApiKey(req, res, next) {
   if (!DELIVER_SECRET) {
     console.warn('⚠️ DELIVER_SECRET not configured — /deliver is unprotected!');
-    return res.status(500).json({ status: 'error', message: 'Server misconfiguration: DELIVER_SECRET not set' });
+    return res.status(500).json({ 
+      status: 'error', 
+      message: 'Server misconfiguration: DELIVER_SECRET not set' 
+    });
   }
-  const key = req.headers['x-api-key'] || req.body?.apiKey;
+  // Accept both X-API-KEY and x-api-key (case insensitive via cors config)
+  const key = req.headers['x-api-key'];
   if (!key || key !== DELIVER_SECRET) {
     console.warn(`🚫 Unauthorized /deliver attempt from ${req.ip}`);
-    return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+    return res.status(401).json({ status: 'error', message: 'Unauthorized - invalid or missing API key' });
   }
   next();
 }
@@ -91,20 +96,24 @@ function requireApiKey(req, res, next) {
 
 /**
  * Format phone number for HubnetGH API
+ * HubnetGH expects format like "0272111262" (Ghana local format)
  */
 function formatPhoneForHubnetGH(phone) {
   let formatted = phone.replace(/\s+/g, '').replace(/-/g, '');
   
+  // Remove leading +
   if (formatted.startsWith('+')) {
     formatted = formatted.substring(1);
   }
   
-  if (formatted.startsWith('0')) {
-    formatted = '233' + formatted.substring(1);
+  // Convert 233 format to 0 format (HubnetGH expects 0XXXXXXXXX)
+  if (formatted.startsWith('233') && formatted.length === 12) {
+    formatted = '0' + formatted.substring(3);
   }
   
-  if (!/^233[0-9]{9}$/.test(formatted)) {
-    throw new Error(`Invalid phone number format: ${phone}. Expected Ghana number.`);
+  // Ensure it starts with 0 and is 10 digits
+  if (!/^0[0-9]{9}$/.test(formatted)) {
+    throw new Error(`Invalid phone number format: ${phone}. Expected Ghana number like 024XXXXXXX.`);
   }
   
   return formatted;
@@ -112,6 +121,7 @@ function formatPhoneForHubnetGH(phone) {
 
 /**
  * Map network type to HubnetGH format
+ * HubnetGH accepts: mtn, airteltigo, telecel
  */
 function mapNetworkToHubnetGH(networkType) {
   const networkMap = {
@@ -119,13 +129,15 @@ function mapNetworkToHubnetGH(networkType) {
     'telecel': 'telecel',
     'airteltigo': 'airteltigo',
     'tel': 'telecel',
-    'at': 'airteltigo'
+    'at': 'airteltigo',
+    'vodafone': 'telecel'
   };
   return networkMap[networkType.toLowerCase()] || networkType.toLowerCase();
 }
 
 /**
- * Core delivery function - calls HubnetGH API
+ * Core delivery function - calls HubnetGH POST /place_order
+ * Docs: https://hubnetgh.site/wp-json/hubnet-api/v1/place_order
  */
 async function deliverData(phone, volumeInGB, networkType, reference = null) {
   const orderRef = reference || `DF-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
@@ -133,15 +145,16 @@ async function deliverData(phone, volumeInGB, networkType, reference = null) {
   const formattedPhone = formatPhoneForHubnetGH(phone);
   const volumeStr = volumeInGB.toString();
 
+  // Match HubnetGH API format exactly
   const payload = {
-    network: hubnetNetwork,
-    volume: volumeStr,
-    customer_number: formattedPhone,
+    network: hubnetNetwork,          // "mtn", "airteltigo", or "telecel"
+    volume: volumeStr,               // String: "1", "2", "5", "10", "20", "50"
+    customer_number: formattedPhone, // "0272111262"
     quantity: 1,
-    request_id: orderRef
+    request_id: orderRef             // Optional unique reference for dedup
   };
 
-  console.log(`📦 Placing order with HubnetGH: ${volumeInGB}GB (${hubnetNetwork}) → ${phone} | Ref: ${orderRef}`);
+  console.log(`📦 Placing order with HubnetGH: ${volumeStr}GB (${hubnetNetwork}) → ${formattedPhone} | Ref: ${orderRef}`);
   console.log(`📤 Payload:`, JSON.stringify(payload));
 
   try {
@@ -157,14 +170,15 @@ async function deliverData(phone, volumeInGB, networkType, reference = null) {
       }
     );
     
-    console.log(`✅ HubnetGH response:`, response.data);
+    console.log(`✅ HubnetGH response:`, JSON.stringify(response.data));
 
+    // HubnetGH returns: { success: true, message: "...", order_id: 1234, total: 15 }
     if (response.data.success) {
       return {
         success: true,
         data: response.data,
         hubnetghOrderId: response.data.order_id,
-        message: response.data.message
+        message: response.data.message || 'Order placed successfully'
       };
     } else {
       throw new Error(response.data.message || 'Order placement failed');
@@ -172,19 +186,27 @@ async function deliverData(phone, volumeInGB, networkType, reference = null) {
   } catch (error) {
     console.error(`❌ HubnetGH API error:`, error.response?.data || error.message);
     
-    const enhancedError = new Error(
-      error.response?.data?.message ||
-      error.response?.data?.error ||
-      error.message ||
-      'Order delivery failed'
-    );
+    const errorMessage = error.response?.data?.message || 
+                         error.response?.data?.error || 
+                         error.message || 
+                         'Order delivery failed';
+    
+    const enhancedError = new Error(errorMessage);
     enhancedError.status = error.response?.status || 500;
     enhancedError.details = error.response?.data || null;
-    enhancedError.code = error.code;
     
-    if (enhancedError.message.toLowerCase().includes('balance') || 
+    // Map HubnetGH error codes
+    if (errorMessage.toLowerCase().includes('balance') || 
+        errorMessage.toLowerCase().includes('insufficient') ||
         error.response?.status === 402) {
       enhancedError.status = 402;
+    }
+    if (errorMessage.toLowerCase().includes('product not found') ||
+        errorMessage.toLowerCase().includes('bundle')) {
+      enhancedError.status = 404;
+    }
+    if (errorMessage.toLowerCase().includes('rate limit')) {
+      enhancedError.status = 429;
     }
     
     throw enhancedError;
@@ -202,6 +224,7 @@ async function handlePaystackWebhook(req, res) {
     return res.status(401).send('Unauthorized');
   }
 
+  // Verify Paystack signature
   const hash = crypto
     .createHmac('sha512', PAYSTACK_SECRET)
     .update(req.body)
@@ -211,7 +234,7 @@ async function handlePaystackWebhook(req, res) {
     console.warn('⚠️ Paystack webhook: invalid signature — rejected');
     return res.status(401).send('Unauthorized');
   }
-  console.log(`✅ Signature verified successfully`);
+  console.log(`✅ Signature verified`);
 
   let event;
   try {
@@ -221,8 +244,10 @@ async function handlePaystackWebhook(req, res) {
     return res.status(400).send('Bad JSON');
   }
 
+  // Always respond 200 quickly
   res.sendStatus(200);
 
+  // Only process charge.success events
   if (event.event !== 'charge.success') {
     console.log(`📝 Webhook event ignored: ${event.event}`);
     return;
@@ -230,14 +255,16 @@ async function handlePaystackWebhook(req, res) {
 
   const { reference, metadata, amount } = event.data;
 
+  // Dedup check
   if (processedRefs.has(reference)) {
-    console.warn(`⚠️ Duplicate webhook ignored for ref: ${reference}`);
+    console.warn(`⚠️ Duplicate webhook ignored: ${reference}`);
     return;
   }
 
+  // Verify transaction with Paystack API
   let txData;
   try {
-    console.log(`🔍 Verifying transaction with Paystack API...`);
+    console.log(`🔍 Verifying transaction: ${reference}`);
     const verifyRes = await axios.get(
       `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
       {
@@ -249,26 +276,25 @@ async function handlePaystackWebhook(req, res) {
     txData = verifyRes.data?.data;
 
     if (!txData || txData.status !== 'success') {
-      console.warn(`⚠️ Paystack API verification failed for ${reference}: status=${txData?.status}`);
+      console.warn(`⚠️ Paystack verification failed: ${reference} status=${txData?.status}`);
       return;
     }
 
     if (process.env.NODE_ENV === 'production' && txData.domain === 'test') {
-      console.warn(`⚠️ Test-mode transaction rejected in production: ${reference}`);
+      console.warn(`⚠️ Test transaction rejected in production: ${reference}`);
       return;
     }
 
     if (txData.amount !== amount) {
-      console.error(`🚨 AMOUNT MISMATCH - FAKE TRANSACTION DETECTED!`);
-      console.error(`   Transaction ${reference} actual amount: ${(txData.amount / 100).toFixed(2)} GHS`);
-      console.error(`   Webhook claimed amount: ${(amount / 100).toFixed(2)} GHS`);
+      console.error(`🚨 AMOUNT MISMATCH! Ref: ${reference}`);
+      console.error(`   Actual: ${(txData.amount / 100).toFixed(2)} GHS`);
+      console.error(`   Webhook: ${(amount / 100).toFixed(2)} GHS`);
       return;
     }
 
-    console.log(`✅ Transaction verified: ${reference} | Amount: ${(txData.amount / 100).toFixed(2)} GHS`);
-
+    console.log(`✅ Transaction verified: ${reference} | GH₵${(txData.amount / 100).toFixed(2)}`);
   } catch (err) {
-    console.error(`❌ Paystack API verification error for ${reference}:`, err.response?.data || err.message);
+    console.error(`❌ Verification error for ${reference}:`, err.response?.data || err.message);
     return;
   }
 
@@ -278,18 +304,19 @@ async function handlePaystackWebhook(req, res) {
   const volumeInGB = metadata?.volumeInGB;
   const networkType = metadata?.networkType;
 
-  console.log(`💰 Payment received: ${reference} | Amount: GH₵${(amount / 100).toFixed(2)}`);
+  console.log(`💰 Payment confirmed: ${reference} | GH₵${(amount / 100).toFixed(2)}`);
 
   if (!phone || !volumeInGB || !networkType) {
-    console.error(`❌ Webhook missing delivery metadata for ref: ${reference}`, { metadata });
+    console.error(`❌ Missing metadata for: ${reference}`, { metadata });
     processedRefs.delete(reference);
     return;
   }
 
+  // Auto-deliver after verified payment
   try {
-    console.log(`🚀 Auto-delivering after verified payment: ${reference}`);
+    console.log(`🚀 Auto-delivering: ${reference}`);
     const result = await deliverData(phone, Number(volumeInGB), networkType, reference);
-    console.log(`🎉 Auto-delivery successful! HubnetGH Order ID: ${result.hubnetghOrderId}`);
+    console.log(`🎉 Auto-delivery successful! HubnetGH Order #${result.hubnetghOrderId}`);
   } catch (err) {
     console.error(`❌ Auto-delivery failed for ${reference}:`, err.message);
     processedRefs.delete(reference);
@@ -307,18 +334,20 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     apiProvider: 'HubnetGH',
     backendUrl: SELF_URL,
-    hubnetghConfigured: !!HUBNETGH_API_KEY && HUBNETGH_API_KEY !== '',
-    paystackConfigured: !!PAYSTACK_SECRET && PAYSTACK_SECRET !== '',
-    deliverProtected:   !!DELIVER_SECRET && DELIVER_SECRET !== '',
-    uptime: process.uptime(),
-    endpoints: ['/deliver', '/api/balance', '/api/order-status/:id', '/paystack-webhook', '/api/bundles', '/api/orders']
+    hubnetghConfigured: !!(HUBNETGH_API_KEY && HUBNETGH_API_KEY.length > 5),
+    paystackConfigured: !!(PAYSTACK_SECRET && PAYSTACK_SECRET.length > 5),
+    deliverProtected: !!(DELIVER_SECRET && DELIVER_SECRET.length > 5),
+    uptime: process.uptime()
   });
 });
 
-// Wallet balance
+// Wallet balance - proxies HubnetGH GET /check_balance
 app.get('/api/balance', async (req, res) => {
   if (!HUBNETGH_API_KEY) {
-    return res.status(500).json({ status: 'error', message: 'HubnetGH API key not configured' });
+    return res.status(500).json({ 
+      status: 'error', 
+      message: 'HubnetGH API key not configured on server' 
+    });
   }
   
   try {
@@ -327,18 +356,32 @@ app.get('/api/balance', async (req, res) => {
       timeout: 10000
     });
     
-    if (response.data.success) {
+    // HubnetGH returns: { success: true, wallet_balance: 115.50 }
+    if (response.data && response.data.success === true) {
       res.json({
         status: 'success',
         data: {
-          balance: response.data.wallet_balance
+          balance: response.data.wallet_balance !== undefined ? 
+                   parseFloat(response.data.wallet_balance) : 0
         }
       });
     } else {
-      res.status(500).json({ status: 'error', message: response.data.message || 'Failed to fetch balance' });
+      res.status(500).json({ 
+        status: 'error', 
+        message: response.data?.message || 'Failed to fetch balance from HubnetGH' 
+      });
     }
   } catch (err) {
     console.error('Balance error:', err.response?.data || err.message);
+    
+    // Check for specific HubnetGH errors
+    if (err.response?.status === 401 || err.response?.status === 403) {
+      return res.status(500).json({ 
+        status: 'error', 
+        message: 'HubnetGH API key invalid or not approved' 
+      });
+    }
+    
     res.status(500).json({ 
       status: 'error', 
       message: err.response?.data?.message || 'Failed to fetch balance from HubnetGH' 
@@ -346,7 +389,7 @@ app.get('/api/balance', async (req, res) => {
   }
 });
 
-// Available bundles
+// Available bundles (from server cache)
 app.get('/api/bundles', async (req, res) => {
   const { network } = req.query;
   
@@ -355,17 +398,18 @@ app.get('/api/bundles', async (req, res) => {
     const prices = BUNDLE_PRICES[networkKey] || BUNDLE_PRICES.mtn;
     
     const bundles = Object.entries(prices).map(([volume, price]) => ({
-      volumeInMB: parseInt(volume) * 1024,
       volumeInGB: parseInt(volume),
       price: price,
       network: networkKey,
-      currency: 'GHS'
+      currency: 'GHS',
+      label: `${volume}GB`
     }));
     
     res.json({
       status: 'success',
       data: bundles,
-      source: 'cache'
+      network: networkKey,
+      source: 'server_pricing_cache'
     });
   } catch (err) {
     console.error('Bundles error:', err.message);
@@ -373,28 +417,37 @@ app.get('/api/bundles', async (req, res) => {
   }
 });
 
-// Check price
+// Check price for specific bundle
 app.post('/api/check-price', async (req, res) => {
   const { networkType, volumeInGB } = req.body;
   
   if (!networkType || !volumeInGB) {
-    return res.status(400).json({ status: 'error', message: 'Missing required fields' });
+    return res.status(400).json({ 
+      status: 'error', 
+      message: 'Missing required fields: networkType, volumeInGB' 
+    });
   }
   
   try {
     const networkKey = mapNetworkToHubnetGH(networkType);
-    const price = BUNDLE_PRICES[networkKey]?.[volumeInGB.toString()];
+    const volumeKey = volumeInGB.toString();
+    const price = BUNDLE_PRICES[networkKey]?.[volumeKey];
     
-    if (!price) {
-      return res.status(404).json({ status: 'error', message: 'Bundle not found' });
+    if (price === undefined) {
+      return res.status(404).json({ 
+        status: 'error', 
+        message: `Bundle not found: ${volumeInGB}GB on ${networkKey}`,
+        availableVolumes: Object.keys(BUNDLE_PRICES[networkKey] || {})
+      });
     }
     
     res.json({
       status: 'success',
       data: {
         price: price,
-        volumeInGB: volumeInGB,
-        network: networkKey
+        volumeInGB: parseInt(volumeInGB),
+        network: networkKey,
+        currency: 'GHS'
       }
     });
   } catch (err) {
@@ -402,16 +455,18 @@ app.post('/api/check-price', async (req, res) => {
   }
 });
 
-// Delivery endpoint
+// Delivery endpoint - calls HubnetGH POST /place_order
 app.post('/deliver', requireApiKey, async (req, res) => {
-  console.log('📦 Received delivery request:', req.body);
+  console.log('📦 Delivery request:', JSON.stringify(req.body));
 
   let { phone, volumeInGB, networkType, ref } = req.body;
   
+  // Support volumeInMB as alternative
   if (req.body.volumeInMB && !volumeInGB) {
     volumeInGB = Math.round(req.body.volumeInMB / 1024);
   }
 
+  // Validate required fields
   if (!phone || !volumeInGB || !networkType) {
     return res.status(400).json({ 
       status: 'error', 
@@ -419,9 +474,9 @@ app.post('/deliver', requireApiKey, async (req, res) => {
     });
   }
 
+  // Validate phone format
   try {
-    const formattedPhone = formatPhoneForHubnetGH(phone);
-    phone = formattedPhone;
+    phone = formatPhoneForHubnetGH(phone);
   } catch (err) {
     return res.status(400).json({ status: 'error', message: err.message });
   }
@@ -429,8 +484,17 @@ app.post('/deliver', requireApiKey, async (req, res) => {
   const normalizedNetwork = mapNetworkToHubnetGH(networkType);
   const volumeNum = Number(volumeInGB);
   
-  if (isNaN(volumeNum) || volumeNum <= 0) {
-    return res.status(400).json({ status: 'error', message: 'volumeInGB must be a positive number' });
+  if (isNaN(volumeNum) || volumeNum <= 0 || !Number.isInteger(volumeNum)) {
+    return res.status(400).json({ 
+      status: 'error', 
+      message: 'volumeInGB must be a positive integer (1, 2, 5, 10, 20, or 50)' 
+    });
+  }
+
+  // Check if bundle exists in our pricing
+  const volumeKey = volumeNum.toString();
+  if (!BUNDLE_PRICES[normalizedNetwork]?.[volumeKey]) {
+    console.warn(`⚠️ Unknown bundle: ${volumeInGB}GB on ${normalizedNetwork} — attempting anyway`);
   }
 
   try {
@@ -438,20 +502,32 @@ app.post('/deliver', requireApiKey, async (req, res) => {
 
     res.json({
       status: 'success',
-      message: result.message || 'Order placed successfully',
+      message: result.message || 'Order placed successfully via HubnetGH',
       data: result.data,
       order_id: result.hubnetghOrderId
     });
   } catch (err) {
     console.error(`❌ POST /deliver error:`, err.message);
-    let statusCode = err.status === 402 ? 402 : err.status === 401 ? 401 : 500;
+    
+    let statusCode = 500;
+    if (err.status === 402) statusCode = 402;
+    else if (err.status === 404) statusCode = 404;
+    else if (err.status === 429) statusCode = 429;
+    
     let errorMessage = err.message;
-    if (err.status === 402) errorMessage = 'Insufficient wallet balance. Please top up your HubnetGH wallet.';
-    res.status(statusCode).json({ status: 'error', message: errorMessage });
+    if (err.status === 402) {
+      errorMessage = 'Insufficient wallet balance. Please top up your HubnetGH wallet.';
+    }
+    
+    res.status(statusCode).json({ 
+      status: 'error', 
+      message: errorMessage,
+      details: err.details || null
+    });
   }
 });
 
-// Order status
+// Order status - proxies HubnetGH GET /order_status?order_id=X
 app.get('/api/order-status/:orderId', async (req, res) => {
   const { orderId } = req.params;
 
@@ -459,8 +535,12 @@ app.get('/api/order-status/:orderId', async (req, res) => {
     return res.status(400).json({ status: 'error', message: 'Order ID is required' });
   }
 
+  if (!HUBNETGH_API_KEY) {
+    return res.status(500).json({ status: 'error', message: 'HubnetGH API key not configured' });
+  }
+
   try {
-    console.log(`🔍 Checking order status for HubnetGH ID: ${orderId}`);
+    console.log(`🔍 Checking HubnetGH order status: ${orderId}`);
 
     const response = await axios.get(
       `${HUBNETGH_API_URL}/order_status?order_id=${encodeURIComponent(orderId)}`,
@@ -470,9 +550,10 @@ app.get('/api/order-status/:orderId', async (req, res) => {
       }
     );
 
-    console.log(`✅ Status for ${orderId}:`, response.data?.status);
-    
+    // HubnetGH returns: { success: true, order_id, status, status_label, customer_number, network, volume, total, created_at }
     const orderData = response.data;
+    console.log(`✅ Status for #${orderId}: ${orderData.status} (${orderData.status_label})`);
+    
     res.json({
       status: 'success',
       data: {
@@ -487,12 +568,12 @@ app.get('/api/order-status/:orderId', async (req, res) => {
       }
     });
   } catch (err) {
-    console.error(`❌ Status check failed for ${orderId}:`, err.response?.data || err.message);
+    console.error(`❌ Status check failed for #${orderId}:`, err.response?.data || err.message);
 
     if (err.response?.status === 404) {
       return res.status(404).json({
         status: 'error',
-        message: 'Order not found. The order may not have been processed yet.'
+        message: `Order #${orderId} not found on HubnetGH`
       });
     }
 
@@ -503,11 +584,11 @@ app.get('/api/order-status/:orderId', async (req, res) => {
   }
 });
 
-// Orders history (use Firebase for this)
-app.get('/api/orders', async (req, res) => {
+// Failed deliveries (placeholder)
+app.get('/api/deliveries/failed', async (req, res) => {
   res.json({
     status: 'info',
-    message: 'Order history not available from HubnetGH API. Use Firebase for order tracking.',
+    message: 'Failed delivery tracking available via Firebase only',
     data: [],
     total: 0
   });
@@ -517,12 +598,21 @@ app.get('/api/orders', async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({ 
     status: 'error', 
-    message: `Route ${req.method} ${req.url} not found`,
-    availableEndpoints: ['/', '/health', '/api/balance', '/api/bundles', '/api/check-price', '/deliver', '/api/order-status/:id', '/paystack-webhook']
+    message: `Route not found: ${req.method} ${req.url}`,
+    availableEndpoints: [
+      'GET /',
+      'GET /health',
+      'GET /api/balance',
+      'GET /api/bundles?network=mtn',
+      'POST /api/check-price',
+      'POST /deliver',
+      'GET /api/order-status/:orderId',
+      'POST /paystack-webhook'
+    ]
   });
 });
 
-// Error handler
+// Global error handler
 app.use((err, req, res, next) => {
   console.error('💥 Server error:', err.stack);
   res.status(500).json({ status: 'error', message: 'Internal server error' });
@@ -533,40 +623,34 @@ app.use((err, req, res, next) => {
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`
-╔══════════════════════════════════════════════════════════════════════╗
-║                                                                      ║
-║   🚀 DataFlow Backend Server (HubnetGH Integration)                  ║
-║                                                                      ║
-║   📡 Port: ${PORT}                                                    ║
-║   🌐 URL:  ${SELF_URL}                                                ║
-║                                                                      ║
-║   🔑 HubnetGH API: ${HUBNETGH_API_KEY ? '✅ Configured' : '❌ NOT SET'}                    ║
-║   💳 Paystack:      ${PAYSTACK_SECRET ? '✅ Configured' : '❌ NOT SET'}                      ║
-║   🔒 /deliver key:  ${DELIVER_SECRET ? '✅ Configured' : '❌ NOT SET'}                      ║
-║                                                                      ║
-║   📮 Endpoints:                                                      ║
-║      GET  /                       → API information                  ║
-║      POST /deliver                → Place order with HubnetGH 🔒     ║
-║      GET  /api/balance            → HubnetGH wallet balance          ║
-║      GET  /api/order-status/:id   → Check order status ✓             ║
-║      POST /paystack-webhook       → Payment webhook handler          ║
-║      GET  /api/bundles            → Available bundles/prices         ║
-║      GET  /health                 → Health check                     ║
-║                                                                      ║
-╚══════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║   🚀 DataFlow Backend v2.0.1 (HubnetGH)                      ║
+║                                                              ║
+║   📡 Port: ${PORT}                                            ║
+║   🌐 URL:  ${SELF_URL}                                        ║
+║                                                              ║
+║   🔑 HubnetGH: ${HUBNETGH_API_KEY ? '✅ Configured' : '❌ NOT SET'}                            ║
+║   💳 Paystack:  ${PAYSTACK_SECRET ? '✅ Configured' : '❌ NOT SET'}                            ║
+║   🔒 Deliver:   ${DELIVER_SECRET ? '✅ Protected' : '❌ NOT SET'}                            ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
   `);
 });
 
-// Keep-alive ping for production
-if (process.env.NODE_ENV === 'production') {
+// Keep-alive ping for Render free tier (every 2 minutes)
+if (process.env.NODE_ENV === 'production' || !process.env.NODE_ENV) {
+  const KEEP_ALIVE_INTERVAL = 2 * 60 * 1000; // 2 minutes
   setInterval(async () => {
     try {
-      await axios.get(`${SELF_URL}/health`, { timeout: 10000 });
-      console.log(`💓 Keep-alive ping - ${new Date().toISOString()}`);
+      const res = await axios.get(`${SELF_URL}/health`, { timeout: 10000 });
+      console.log(`💓 Keep-alive ping OK - ${new Date().toISOString()}`);
     } catch (err) {
-      console.error(`⚠️ Keep-alive ping failed:`, err.message);
+      console.error(`⚠️ Keep-alive ping failed: ${err.message}`);
     }
-  }, 4 * 60 * 1000);
+  }, KEEP_ALIVE_INTERVAL);
+  
+  console.log(`🔄 Keep-alive pings enabled (every ${KEEP_ALIVE_INTERVAL / 60000} minutes)`);
 }
 
 module.exports = app;
