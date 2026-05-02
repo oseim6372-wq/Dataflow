@@ -76,7 +76,7 @@ function verifyPaystackSignature(rawBody, signature) {
   return hash === signature;
 }
 
-// ── Utility ───────────────────────────────────────────────────
+// ── Utility Functions ─────────────────────────────────────────
 function resolveVolume(volumeInMB) {
   const mb = Number(volumeInMB);
   if (mb >= 1024) {
@@ -95,41 +95,7 @@ function resolveNetwork(networkType) {
   return NETWORK_MAP[networkType?.toLowerCase()] || networkType || "mtn";
 }
 
-// ── Routes ────────────────────────────────────────────────────
-
-// Health check
-app.get("/health", async (_req, res) => {
-  res.json({
-    status: "OK",
-    service: "DataFlow GH Backend",
-    timestamp: new Date().toISOString(),
-    hubnetConfigured: !!process.env.HUBNET_API_KEY,
-    paystackConfigured: !!process.env.PAYSTACK_SECRET_KEY,
-    firebaseConfigured: !!db,
-  });
-});
-
-// GET /api/balance
-app.get("/api/balance", async (_req, res) => {
-  try {
-    const { data } = await hubnet.get("/check_balance");
-    if (data.success) {
-      return res.json({
-        status: "success",
-        data: { balance: data.wallet_balance },
-      });
-    }
-    return res.status(502).json({
-      status: "error",
-      message: data.message || "Failed to fetch balance",
-    });
-  } catch (err) {
-    console.error("❌ /api/balance error:", err.message);
-    return res.status(500).json({ status: "error", message: err.message });
-  }
-});
-
-// HubNet Cost Prices
+// ── HubNet Cost Prices ────────────────────────────────────────
 const HUBNET_PRICES = {
   mtn: [
     { volume: "1", volumeInMB: 1024, price: 4.00 },
@@ -177,7 +143,7 @@ const HUBNET_PRICES = {
   ],
 };
 
-// Profit settings
+// ── Profit Settings ───────────────────────────────────────────
 async function getProfitSettings() {
   if (profitSettingsCache) return profitSettingsCache;
   if (!db) return { mode: "flat", flatAmount: 0 };
@@ -206,7 +172,43 @@ function applyProfit(costPrice, volumeInMB, network, settings) {
   return Math.ceil((costPrice + flat) * 20) / 20;
 }
 
-// GET /api/bundles
+// ============================================================
+// ROUTES
+// ============================================================
+
+// Health check
+app.get("/health", async (_req, res) => {
+  res.json({
+    status: "OK",
+    service: "DataFlow GH Backend",
+    timestamp: new Date().toISOString(),
+    hubnetConfigured: !!process.env.HUBNET_API_KEY,
+    paystackConfigured: !!process.env.PAYSTACK_SECRET_KEY,
+    firebaseConfigured: !!db,
+  });
+});
+
+// Get wallet balance
+app.get("/api/balance", async (_req, res) => {
+  try {
+    const { data } = await hubnet.get("/check_balance");
+    if (data.success) {
+      return res.json({
+        status: "success",
+        data: { balance: data.wallet_balance },
+      });
+    }
+    return res.status(502).json({
+      status: "error",
+      message: data.message || "Failed to fetch balance",
+    });
+  } catch (err) {
+    console.error("❌ /api/balance error:", err.message);
+    return res.status(500).json({ status: "error", message: err.message });
+  }
+});
+
+// Get bundles with profit applied
 app.get("/api/bundles", async (req, res) => {
   const network = (req.query.network || "mtn").toLowerCase();
   const baseBundles = HUBNET_PRICES[network] || HUBNET_PRICES.mtn;
@@ -221,54 +223,14 @@ app.get("/api/bundles", async (req, res) => {
     return res.json({ status: "success", data: bundles });
   } catch (err) {
     console.error("❌ /api/bundles error:", err.message);
-    return res.json({ status: "success", data: baseBundles.map(b => ({ ...b, network, costPrice: b.price })) });
+    return res.json({
+      status: "success",
+      data: baseBundles.map(b => ({ ...b, network, costPrice: b.price })),
+    });
   }
 });
 
-// GET /api/profit-settings
-app.get("/api/profit-settings", async (_req, res) => {
-  try {
-    const settings = await getProfitSettings();
-    const preview = {};
-    for (const [net, bundles] of Object.entries(HUBNET_PRICES)) {
-      preview[net] = bundles.map((b) => ({
-        ...b,
-        sellingPrice: applyProfit(b.price, b.volumeInMB, net, settings),
-        profit: parseFloat((applyProfit(b.price, b.volumeInMB, net, settings) - b.price).toFixed(2)),
-      }));
-    }
-    return res.json({ status: "success", settings, preview });
-  } catch (err) {
-    return res.status(500).json({ status: "error", message: err.message });
-  }
-});
-
-// POST /api/profit-settings
-app.post("/api/profit-settings", async (req, res) => {
-  const { mode, flatAmount, percentAmount, perBundle } = req.body;
-  const validModes = ["flat", "percent", "perBundle"];
-  if (!validModes.includes(mode)) {
-    return res.status(400).json({ status: "error", message: "mode must be flat | percent | perBundle" });
-  }
-  const settings = { mode, flatAmount: parseFloat(flatAmount) || 0, percentAmount: parseFloat(percentAmount) || 0, perBundle: perBundle || {}, updatedAt: new Date().toISOString() };
-  try {
-    if (db) await db.ref("system/profitSettings").set(settings);
-    profitSettingsCache = settings;
-    console.log(`✅ Profit settings updated: mode=${mode}`);
-    return res.json({ status: "success", message: "Profit settings saved", settings });
-  } catch (err) {
-    return res.status(500).json({ status: "error", message: err.message });
-  }
-});
-
-// POST /api/bundles/refresh
-app.post("/api/bundles/refresh", (_req, res) => {
-  profitSettingsCache = null;
-  console.log("🔄 Profit settings cache cleared");
-  res.json({ status: "success", message: "Cache cleared" });
-});
-
-// POST /deliver
+// Delivery endpoint
 app.post("/deliver", async (req, res) => {
   const { phone, networkType, volumeInMB, ref } = req.body;
 
@@ -322,7 +284,7 @@ app.post("/deliver", async (req, res) => {
   }
 });
 
-// GET /api/order-status/:reference
+// Order status
 app.get("/api/order-status/:reference", async (req, res) => {
   const { reference } = req.params;
   if (!reference) {
@@ -362,7 +324,7 @@ app.get("/api/order-status/:reference", async (req, res) => {
 });
 
 // ============================================================
-// FIXED PAYSTACK WEBHOOK - NO SYNTAX ERROR
+// PAYSTACK WEBHOOK - FIXED (No duplicate orders)
 // ============================================================
 app.post("/paystack/webhook", async (req, res) => {
   const signature = req.headers["x-paystack-signature"];
@@ -394,6 +356,7 @@ app.post("/paystack/webhook", async (req, res) => {
     const ref = data.reference;
     const customerEmail = data.customer?.email;
     const amount = data.amount ? data.amount / 100 : 0;
+    const orderIdFromMeta = meta.orderId || meta.order_id;
 
     console.log(`💳 Processing charge.success: ref=${ref}, phone=${phone}, volume=${volumeInMB}MB`);
 
@@ -406,6 +369,35 @@ app.post("/paystack/webhook", async (req, res) => {
       const network = resolveNetwork(networkType);
       const volume = resolveVolume(volumeInMB);
 
+      // ============================================================
+      // IMPORTANT: FIRST check if order already exists in Firebase
+      // This prevents duplicate orders!
+      // ============================================================
+      let existingOrderKey = null;
+      let existingOrderData = null;
+
+      if (db) {
+        // Try to find existing order by Paystack reference
+        const snapshot = await db.ref("orders").orderByChild("ref").equalTo(ref).once("value");
+        const orders = snapshot.val();
+        
+        if (orders) {
+          existingOrderKey = Object.keys(orders)[0];
+          existingOrderData = orders[existingOrderKey];
+          console.log(`✅ Found existing order by ref: ${existingOrderKey}`);
+        } else if (orderIdFromMeta) {
+          // Also try to find by orderId (DF-XXXX format from frontend)
+          const orderIdSnapshot = await db.ref("orders").orderByChild("orderId").equalTo(orderIdFromMeta).once("value");
+          const orderIdOrders = orderIdSnapshot.val();
+          if (orderIdOrders) {
+            existingOrderKey = Object.keys(orderIdOrders)[0];
+            existingOrderData = orderIdOrders[existingOrderKey];
+            console.log(`✅ Found existing order by orderId: ${existingOrderKey}`);
+          }
+        }
+      }
+
+      // Attempt delivery via HubNet
       const hubnetRes = await hubnet.post("/place_order", {
         network,
         volume,
@@ -418,27 +410,29 @@ app.post("/paystack/webhook", async (req, res) => {
         console.log(`✅ Auto-delivered: ${volume}GB to ${phone} | order_id: ${hubnetRes.data.order_id}`);
 
         if (db) {
-          const snapshot = await db.ref("orders").orderByChild("ref").equalTo(ref).once("value");
-          const orders = snapshot.val();
-
-          if (orders) {
-            const key = Object.keys(orders)[0];
-            await db.ref(`orders/${key}`).update({
+          if (existingOrderKey) {
+            // UPDATE existing order - DO NOT CREATE NEW ONE
+            await db.ref(`orders/${existingOrderKey}`).update({
               status: "completed",
               deliveryStatus: "delivered",
               remaDataRef: String(hubnetRes.data.order_id),
               deliveryTime: new Date().toISOString(),
               autoDelivered: true,
+              webhookProcessed: true,
+              webhookProcessedAt: new Date().toISOString(),
             });
-            console.log(`✅ Firebase order ${key} updated`);
+            console.log(`✅ Updated existing order: ${existingOrderKey} (NO DUPLICATE CREATED)`);
           } else {
+            // ONLY CREATE NEW ORDER IF ABSOLUTELY NECESSARY
+            // This should rarely happen since frontend creates the order first
+            console.warn(`⚠️ No existing order found for ref: ${ref} - creating fallback order`);
             const newOrderRef = db.ref("orders").push();
             await newOrderRef.set({
               orderId: `WEB-${Date.now()}`,
               ref: ref,
               phone: phone,
               email: customerEmail || "webhook@paystack.com",
-              name: meta.name || "Auto Order",
+              name: meta.name || "Webhook Order",
               bundle: `${volume}GB`,
               network: networkType || "mtn",
               networkType: network,
@@ -449,19 +443,76 @@ app.post("/paystack/webhook", async (req, res) => {
               deliveryStatus: "delivered",
               remaDataRef: String(hubnetRes.data.order_id),
               timestamp: new Date().toISOString(),
-              source: "paystack_webhook",
+              source: "paystack_webhook_fallback",
             });
-            console.log(`✅ New order created from webhook`);
+            console.log(`✅ Created fallback order from webhook (frontend didn't create one)`);
           }
         }
       } else {
         console.error(`❌ HubNet delivery failed: ${hubnetRes.data.message}`);
+        
+        // Update existing order as failed if needed
+        if (db && existingOrderKey) {
+          await db.ref(`orders/${existingOrderKey}`).update({
+            status: "paid-pending-delivery",
+            deliveryError: hubnetRes.data.message || "Auto-delivery failed",
+            webhookProcessed: true,
+          });
+          console.log(`✅ Updated existing order as pending: ${existingOrderKey}`);
+        }
       }
     } catch (err) {
       console.error(`❌ Webhook delivery error: ${err.message}`);
     }
   }
-});  // <-- ONLY ONE CLOSING BRACKET HERE
+});
+
+// Profit settings endpoints
+app.get("/api/profit-settings", async (_req, res) => {
+  try {
+    const settings = await getProfitSettings();
+    const preview = {};
+    for (const [net, bundles] of Object.entries(HUBNET_PRICES)) {
+      preview[net] = bundles.map((b) => ({
+        ...b,
+        sellingPrice: applyProfit(b.price, b.volumeInMB, net, settings),
+        profit: parseFloat((applyProfit(b.price, b.volumeInMB, net, settings) - b.price).toFixed(2)),
+      }));
+    }
+    return res.json({ status: "success", settings, preview });
+  } catch (err) {
+    return res.status(500).json({ status: "error", message: err.message });
+  }
+});
+
+app.post("/api/profit-settings", async (req, res) => {
+  const { mode, flatAmount, percentAmount, perBundle } = req.body;
+  const validModes = ["flat", "percent", "perBundle"];
+  if (!validModes.includes(mode)) {
+    return res.status(400).json({ status: "error", message: "mode must be flat | percent | perBundle" });
+  }
+  const settings = {
+    mode,
+    flatAmount: parseFloat(flatAmount) || 0,
+    percentAmount: parseFloat(percentAmount) || 0,
+    perBundle: perBundle || {},
+    updatedAt: new Date().toISOString(),
+  };
+  try {
+    if (db) await db.ref("system/profitSettings").set(settings);
+    profitSettingsCache = settings;
+    console.log(`✅ Profit settings updated: mode=${mode}`);
+    return res.json({ status: "success", message: "Profit settings saved", settings });
+  } catch (err) {
+    return res.status(500).json({ status: "error", message: err.message });
+  }
+});
+
+app.post("/api/bundles/refresh", (_req, res) => {
+  profitSettingsCache = null;
+  console.log("🔄 Profit settings cache cleared");
+  res.json({ status: "success", message: "Cache cleared" });
+});
 
 // Catch-all 404
 app.use((_req, res) => {
@@ -473,5 +524,7 @@ app.listen(PORT, () => {
   console.log(`\n🚀 DataFlow GH Backend running on port ${PORT}`);
   console.log(`   HubNet API key : ${process.env.HUBNET_API_KEY ? "✓ set" : "✗ MISSING"}`);
   console.log(`   Paystack key   : ${process.env.PAYSTACK_SECRET_KEY ? "✓ set" : "✗ MISSING"}`);
-  console.log(`   Firebase DB    : ${db ? "✓ connected" : "✗ not connected"}\n`);
+  console.log(`   Firebase DB    : ${db ? "✓ connected" : "✗ not connected"}`);
+  console.log(`\n📌 Webhook endpoint: /paystack/webhook`);
+  console.log(`   Duplicate order protection: ENABLED\n`);
 });
