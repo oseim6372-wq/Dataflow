@@ -15,7 +15,24 @@ const PORT = process.env.PORT || 3000;
 
 // ── Middleware ────────────────────────────────────────────────
 app.use(cors({ origin: "*" }));
-app.use(express.json());
+
+// Paystack webhook needs the RAW body for signature verification.
+// We must capture it BEFORE express.json() parses it into an object.
+// Solution: store raw body on req.rawBody for the webhook route,
+// while still allowing express.json() to work for all other routes.
+app.use((req, res, next) => {
+  if (req.path === "/paystack/webhook") {
+    let raw = [];
+    req.on("data", chunk => raw.push(chunk));
+    req.on("end", () => {
+      req.rawBody = Buffer.concat(raw);
+      next();
+    });
+    req.on("error", next);
+  } else {
+    express.json()(req, res, next);
+  }
+});
 
 // ── Firebase Admin Initialisation ────────────────────────────
 let db = null;
@@ -51,10 +68,11 @@ const hubnet = axios.create({
 // ── Paystack helper ───────────────────────────────────────────
 function verifyPaystackSignature(rawBody, signature) {
   const secret = process.env.PAYSTACK_SECRET_KEY;
-  if (!secret) return false;
+  if (!secret || !rawBody || !signature) return false;
+  const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody);
   const hash = crypto
     .createHmac("sha512", secret)
-    .update(rawBody)
+    .update(body)
     .digest("hex");
   return hash === signature;
 }
@@ -392,23 +410,23 @@ app.get("/api/order-status/:reference", async (req, res) => {
 
 // ── POST /paystack/webhook ────────────────────────────────────
 // Receives Paystack charge.success events and auto-delivers data.
-app.post(
-  "/paystack/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
+app.post("/paystack/webhook", async (req, res) => {
     const signature = req.headers["x-paystack-signature"];
 
-    if (!verifyPaystackSignature(req.body, signature)) {
+    if (!verifyPaystackSignature(req.rawBody, signature)) {
       console.warn("⚠️  Invalid Paystack webhook signature");
       return res.status(401).json({ error: "Invalid signature" });
     }
 
     let event;
     try {
-      event = JSON.parse(req.body.toString());
+      event = JSON.parse(req.rawBody.toString());
     } catch {
       return res.status(400).json({ error: "Invalid JSON" });
     }
+
+    // Respond to Paystack immediately — delivery happens async
+    res.json({ received: true });
 
     if (event.event === "charge.success") {
       const meta = event.data.metadata || {};
@@ -432,8 +450,10 @@ app.post(
             request_id: ref,
           });
 
-          if (data.success && db) {
-            // Update Firebase order status
+          console.log(`✅ Webhook delivery: HubNet order_id=${data.order_id} | success=${data.success}`);
+
+          if (db) {
+            // Find the Firebase order by ref and update its status
             const snapshot = await db
               .ref("orders")
               .orderByChild("ref")
@@ -443,20 +463,36 @@ app.post(
             if (orders) {
               const key = Object.keys(orders)[0];
               await db.ref(`orders/${key}`).update({
-                status: "completed",
-                deliveryStatus: "delivered",
-                remaDataRef: String(data.order_id),
+                status: data.success ? "completed" : "failed",
+                deliveryStatus: data.success ? "delivered" : "failed",
+                remaDataRef: data.success ? String(data.order_id) : null,
                 deliveryTime: new Date().toISOString(),
               });
+              console.log(`✅ Firebase order ${key} updated`);
+            } else {
+              // Order not found in Firebase — create a new record
+              await db.ref("orders").push({
+                ref,
+                phone,
+                networkType,
+                volumeInMB,
+                status: data.success ? "completed" : "failed",
+                deliveryStatus: data.success ? "delivered" : "failed",
+                remaDataRef: data.success ? String(data.order_id) : null,
+                source: "webhook",
+                createdAt: new Date().toISOString(),
+                deliveryTime: new Date().toISOString(),
+              });
+              console.log(`✅ New order created in Firebase from webhook`);
             }
           }
         } catch (err) {
           console.error("❌ Webhook delivery error:", err.message);
         }
+      } else {
+        console.warn(`⚠️  Webhook missing phone or volumeInMB in metadata`, meta);
       }
     }
-
-    res.json({ received: true });
   }
 );
 
