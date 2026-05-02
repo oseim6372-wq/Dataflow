@@ -97,6 +97,7 @@ app.get("/health", async (_req, res) => {
     hubnetConfigured: !!process.env.HUBNET_API_KEY,
     paystackConfigured: !!process.env.PAYSTACK_SECRET_KEY,
     firebaseConfigured: !!db,
+    profitSettingsCached: !!profitSettingsCache,
   });
 });
 
@@ -125,38 +126,162 @@ app.get("/api/balance", async (_req, res) => {
   }
 });
 
+// ── HubNet Cost Prices (confirmed from hubnetgh.site) ─────────
+// These are the exact wholesale prices from HubNet's platform.
+// The frontend adds your profit margin on top of these.
+const HUBNET_PRICES = {
+  mtn: [
+    { volume: "1",   volumeInMB: 1024,   price: 4.00  },
+    { volume: "2",   volumeInMB: 2048,   price: 8.00  },
+    { volume: "3",   volumeInMB: 3072,   price: 12.00 },
+    { volume: "4",   volumeInMB: 4096,   price: 16.00 },
+    { volume: "5",   volumeInMB: 5120,   price: 19.60 },
+    { volume: "6",   volumeInMB: 6144,   price: 24.00 },
+    { volume: "7",   volumeInMB: 7168,   price: 27.00 },
+    { volume: "8",   volumeInMB: 8192,   price: 32.00 },
+    { volume: "10",  volumeInMB: 10240,  price: 39.00 },
+    { volume: "15",  volumeInMB: 15360,  price: 57.00 },
+    { volume: "20",  volumeInMB: 20480,  price: 77.10 },
+    { volume: "25",  volumeInMB: 25600,  price: 96.00 },
+    { volume: "30",  volumeInMB: 30720,  price: 116.00 },
+    { volume: "40",  volumeInMB: 40960,  price: 155.00 },
+    { volume: "50",  volumeInMB: 51200,  price: 186.00 },
+    { volume: "100", volumeInMB: 102400, price: 370.00 },
+  ],
+  telecel: [
+    { volume: "10",  volumeInMB: 10240,  price: 38.00  },
+    { volume: "15",  volumeInMB: 15360,  price: 55.00  },
+    { volume: "20",  volumeInMB: 20480,  price: 74.00  },
+    { volume: "25",  volumeInMB: 25600,  price: 92.00  },
+    { volume: "30",  volumeInMB: 30720,  price: 109.00 },
+    { volume: "40",  volumeInMB: 40960,  price: 143.00 },
+    { volume: "50",  volumeInMB: 51200,  price: 177.00 },
+    { volume: "100", volumeInMB: 102400, price: 354.00 },
+  ],
+  airteltigo: [
+    { volume: "1",   volumeInMB: 1024,   price: 3.90  },
+    { volume: "2",   volumeInMB: 2048,   price: 7.80  },
+    { volume: "3",   volumeInMB: 3072,   price: 11.80 },
+    { volume: "4",   volumeInMB: 4096,   price: 15.70 },
+    { volume: "5",   volumeInMB: 5120,   price: 19.40 },
+    { volume: "6",   volumeInMB: 6144,   price: 23.80 },
+    { volume: "7",   volumeInMB: 7168,   price: 27.40 },
+    { volume: "8",   volumeInMB: 8192,   price: 31.00 },
+    { volume: "9",   volumeInMB: 9216,   price: 35.00 },
+    { volume: "10",  volumeInMB: 10240,  price: 39.00 },
+    { volume: "12",  volumeInMB: 12288,  price: 47.00 },
+    { volume: "15",  volumeInMB: 15360,  price: 59.00 },
+    { volume: "20",  volumeInMB: 20480,  price: 78.50 },
+    { volume: "25",  volumeInMB: 25600,  price: 98.00 },
+  ],
+};
+
+// ── Profit settings store (Firebase-backed) ───────────────────
+// Profit config shape saved in Firebase at: system/profitSettings
+// {
+//   mode: "flat" | "percent" | "perBundle",
+//   flatAmount: 1.00,          // added to every bundle (mode=flat)
+//   percentAmount: 10,         // % added on top (mode=percent)
+//   perBundle: { "mtn_1024": 0.50, ... }  // per-bundle overrides (mode=perBundle)
+// }
+let profitSettingsCache = null;
+
+async function getProfitSettings() {
+  if (profitSettingsCache) return profitSettingsCache;
+  if (!db) return { mode: "flat", flatAmount: 0 };
+  try {
+    const snap = await db.ref("system/profitSettings").once("value");
+    profitSettingsCache = snap.val() || { mode: "flat", flatAmount: 0 };
+    return profitSettingsCache;
+  } catch {
+    return { mode: "flat", flatAmount: 0 };
+  }
+}
+
+function applyProfit(costPrice, volumeInMB, network, settings) {
+  if (!settings) return costPrice;
+  const { mode, flatAmount, percentAmount, perBundle } = settings;
+  if (mode === "percent") {
+    const pct = parseFloat(percentAmount) || 0;
+    return Math.ceil((costPrice * (1 + pct / 100)) * 20) / 20;
+  }
+  if (mode === "perBundle") {
+    const key = `${network}_${volumeInMB}`;
+    const bundleProfit = parseFloat(perBundle?.[key]) || parseFloat(flatAmount) || 0;
+    return Math.ceil((costPrice + bundleProfit) * 20) / 20;
+  }
+  // Default: flat
+  const flat = parseFloat(flatAmount) || 0;
+  return Math.ceil((costPrice + flat) * 20) / 20;
+}
+
 // ── GET /api/bundles ──────────────────────────────────────────
-// Returns available data bundles for a network.
-// The frontend passes ?network=mtn|telecel|airteltigo
-// We return a normalised list so the frontend can display prices.
-//
-// HubNet doesn't have a "list bundles" endpoint, so we expose
-// our own curated bundle list and mark their cost price + MB.
-app.get("/api/bundles", (req, res) => {
+// Returns HubNet cost prices + your profit margin applied.
+// Frontend passes ?network=mtn|telecel|airteltigo
+app.get("/api/bundles", async (req, res) => {
   const network = (req.query.network || "mtn").toLowerCase();
+  const baseBundles = HUBNET_PRICES[network] || HUBNET_PRICES.mtn;
+  try {
+    const settings = await getProfitSettings();
+    const bundles = baseBundles.map((b) => ({
+      ...b,
+      network,
+      costPrice: b.price,
+      price: applyProfit(b.price, b.volumeInMB, network, settings),
+    }));
+    return res.json({ status: "success", data: bundles });
+  } catch (err) {
+    console.error("❌ /api/bundles error:", err.message);
+    return res.json({ status: "success", data: baseBundles.map(b => ({ ...b, network, costPrice: b.price })) });
+  }
+});
 
-  // Curated MTN SME bundle list — price = HubNet cost (GHS).
-  // Update these whenever HubNet changes rates.
-  const MTN_BUNDLES = [
-    { volumeInMB: 1000,  price: 4.50  }, // ~1 GB
-    { volumeInMB: 2048,  price: 8.50  }, // 2 GB
-    { volumeInMB: 3072,  price: 12.00 }, // 3 GB
-    { volumeInMB: 5120,  price: 19.00 }, // 5 GB
-    { volumeInMB: 10240, price: 36.00 }, // 10 GB
-    { volumeInMB: 15360, price: 52.00 }, // 15 GB
-    { volumeInMB: 20480, price: 68.00 }, // 20 GB
-    { volumeInMB: 30720, price: 98.00 }, // 30 GB
-    { volumeInMB: 51200, price: 155.00 }, // 50 GB
-  ];
+// ── GET /api/profit-settings ──────────────────────────────────
+// Admin: get current profit configuration
+app.get("/api/profit-settings", async (_req, res) => {
+  try {
+    const settings = await getProfitSettings();
+    // Also return the raw HubNet prices so admin can preview
+    const preview = {};
+    for (const [net, bundles] of Object.entries(HUBNET_PRICES)) {
+      preview[net] = bundles.map((b) => ({
+        ...b,
+        sellingPrice: applyProfit(b.price, b.volumeInMB, net, settings),
+        profit: parseFloat((applyProfit(b.price, b.volumeInMB, net, settings) - b.price).toFixed(2)),
+      }));
+    }
+    return res.json({ status: "success", settings, preview });
+  } catch (err) {
+    return res.status(500).json({ status: "error", message: err.message });
+  }
+});
 
-  // For now all networks use the same list.
-  // Extend with TELECEL_BUNDLES / AT_BUNDLES when supported by HubNet.
-  const bundles = MTN_BUNDLES.map((b) => ({
-    ...b,
-    network: network,
-  }));
+// ── POST /api/profit-settings ─────────────────────────────────
+// Admin: save profit configuration
+// Body: { mode, flatAmount?, percentAmount?, perBundle? }
+app.post("/api/profit-settings", async (req, res) => {
+  const { mode, flatAmount, percentAmount, perBundle } = req.body;
+  const validModes = ["flat", "percent", "perBundle"];
+  if (!validModes.includes(mode)) {
+    return res.status(400).json({ status: "error", message: "mode must be flat | percent | perBundle" });
+  }
+  const settings = { mode, flatAmount: parseFloat(flatAmount) || 0, percentAmount: parseFloat(percentAmount) || 0, perBundle: perBundle || {}, updatedAt: new Date().toISOString() };
+  try {
+    if (db) await db.ref("system/profitSettings").set(settings);
+    profitSettingsCache = settings; // update in-memory cache
+    console.log(`✅ Profit settings updated: mode=${mode}`);
+    return res.json({ status: "success", message: "Profit settings saved", settings });
+  } catch (err) {
+    return res.status(500).json({ status: "error", message: err.message });
+  }
+});
 
-  return res.json({ status: "success", data: bundles });
+// ── POST /api/bundles/refresh ─────────────────────────────────
+// Admin: clears profit settings cache so next request re-reads Firebase
+app.post("/api/bundles/refresh", (_req, res) => {
+  profitSettingsCache = null;
+  console.log("🔄 Profit settings cache cleared");
+  res.json({ status: "success", message: "Cache cleared. Prices will reload from Firebase on next request." });
 });
 
 // ── POST /deliver ─────────────────────────────────────────────
