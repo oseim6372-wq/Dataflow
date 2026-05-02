@@ -284,16 +284,62 @@ app.post("/deliver", async (req, res) => {
   }
 });
 
-// Order status
+// ============================================================
+// FIXED: Order Status endpoint - handles both Paystack refs and HubNet IDs
+// ============================================================
 app.get("/api/order-status/:reference", async (req, res) => {
   const { reference } = req.params;
+
   if (!reference) {
     return res.status(400).json({ status: "error", message: "Missing order reference" });
   }
+
+  // Determine if this is a Paystack reference (starts with DF or contains letters)
+  const isPaystackRef = reference.startsWith('DF') || /[A-Za-z]/.test(reference);
+  
+  let hubnetOrderId = reference;
+  
+  // If it's a Paystack reference, we need to look up the HubNet order ID from Firebase
+  if (isPaystackRef && db) {
+    try {
+      // Try to find by ref field first
+      let snapshot = await db.ref("orders").orderByChild("ref").equalTo(reference).once("value");
+      let orders = snapshot.val();
+      
+      if (!orders) {
+        // Try by orderId field
+        snapshot = await db.ref("orders").orderByChild("orderId").equalTo(reference).once("value");
+        orders = snapshot.val();
+      }
+      
+      if (orders) {
+        const orderKey = Object.keys(orders)[0];
+        const order = orders[orderKey];
+        if (order.hubnetRef || order.remaDataRef) {
+          hubnetOrderId = order.hubnetRef || order.remaDataRef;
+          console.log(`✅ Converted ${reference} to HubNet ID: ${hubnetOrderId}`);
+        } else {
+          console.log(`⚠️ No HubNet reference found for ${reference}`);
+          return res.status(404).json({ 
+            status: "error", 
+            message: "No HubNet order ID found for this reference" 
+          });
+        }
+      } else {
+        console.log(`⚠️ No order found for reference: ${reference}`);
+        return res.status(404).json({ status: "error", message: "Order not found" });
+      }
+    } catch (err) {
+      console.error("❌ Error looking up order:", err.message);
+      return res.status(500).json({ status: "error", message: "Database error" });
+    }
+  }
+
   try {
     const { data } = await hubnet.get("/order_status", {
-      params: { order_id: reference },
+      params: { order_id: hubnetOrderId },
     });
+
     if (data.success) {
       return res.json({
         status: "success",
@@ -309,6 +355,7 @@ app.get("/api/order-status/:reference", async (req, res) => {
         },
       });
     }
+
     return res.status(404).json({
       status: "error",
       message: data.message || "Order not found",
@@ -324,7 +371,7 @@ app.get("/api/order-status/:reference", async (req, res) => {
 });
 
 // ============================================================
-// PAYSTACK WEBHOOK - FIXED (No duplicate orders)
+// FIXED: Paystack Webhook - correctly finds existing orders
 // ============================================================
 app.post("/paystack/webhook", async (req, res) => {
   const signature = req.headers["x-paystack-signature"];
@@ -370,29 +417,46 @@ app.post("/paystack/webhook", async (req, res) => {
       const volume = resolveVolume(volumeInMB);
 
       // ============================================================
-      // IMPORTANT: FIRST check if order already exists in Firebase
-      // This prevents duplicate orders!
+      // IMPORTANT: Find existing order by multiple methods
       // ============================================================
       let existingOrderKey = null;
       let existingOrderData = null;
 
       if (db) {
-        // Try to find existing order by Paystack reference
-        const snapshot = await db.ref("orders").orderByChild("ref").equalTo(ref).once("value");
-        const orders = snapshot.val();
+        // Method 1: Search by Paystack reference (ref field)
+        let snapshot = await db.ref("orders").orderByChild("ref").equalTo(ref).once("value");
+        let orders = snapshot.val();
         
         if (orders) {
           existingOrderKey = Object.keys(orders)[0];
           existingOrderData = orders[existingOrderKey];
-          console.log(`✅ Found existing order by ref: ${existingOrderKey}`);
-        } else if (orderIdFromMeta) {
-          // Also try to find by orderId (DF-XXXX format from frontend)
-          const orderIdSnapshot = await db.ref("orders").orderByChild("orderId").equalTo(orderIdFromMeta).once("value");
-          const orderIdOrders = orderIdSnapshot.val();
-          if (orderIdOrders) {
-            existingOrderKey = Object.keys(orderIdOrders)[0];
-            existingOrderData = orderIdOrders[existingOrderKey];
-            console.log(`✅ Found existing order by orderId: ${existingOrderKey}`);
+          console.log(`✅ Found order by ref: ${existingOrderKey}`);
+        }
+        
+        // Method 2: Search by orderId (DF-XXXX format)
+        if (!existingOrderKey && orderIdFromMeta) {
+          snapshot = await db.ref("orders").orderByChild("orderId").equalTo(orderIdFromMeta).once("value");
+          orders = snapshot.val();
+          if (orders) {
+            existingOrderKey = Object.keys(orders)[0];
+            existingOrderData = orders[existingOrderKey];
+            console.log(`✅ Found order by orderId: ${existingOrderKey}`);
+          }
+        }
+        
+        // Method 3: Search by scanning all orders (fallback)
+        if (!existingOrderKey) {
+          const allOrders = await db.ref("orders").once("value");
+          const allOrdersData = allOrders.val();
+          if (allOrdersData) {
+            for (const [key, order] of Object.entries(allOrdersData)) {
+              if (order.ref === ref || order.orderId === ref || order.orderId === orderIdFromMeta) {
+                existingOrderKey = key;
+                existingOrderData = order;
+                console.log(`✅ Found order by scanning: ${existingOrderKey}`);
+                break;
+              }
+            }
           }
         }
       }
@@ -416,6 +480,7 @@ app.post("/paystack/webhook", async (req, res) => {
               status: "completed",
               deliveryStatus: "delivered",
               remaDataRef: String(hubnetRes.data.order_id),
+              hubnetRef: String(hubnetRes.data.order_id),
               deliveryTime: new Date().toISOString(),
               autoDelivered: true,
               webhookProcessed: true,
@@ -424,7 +489,6 @@ app.post("/paystack/webhook", async (req, res) => {
             console.log(`✅ Updated existing order: ${existingOrderKey} (NO DUPLICATE CREATED)`);
           } else {
             // ONLY CREATE NEW ORDER IF ABSOLUTELY NECESSARY
-            // This should rarely happen since frontend creates the order first
             console.warn(`⚠️ No existing order found for ref: ${ref} - creating fallback order`);
             const newOrderRef = db.ref("orders").push();
             await newOrderRef.set({
@@ -442,10 +506,11 @@ app.post("/paystack/webhook", async (req, res) => {
               status: "completed",
               deliveryStatus: "delivered",
               remaDataRef: String(hubnetRes.data.order_id),
+              hubnetRef: String(hubnetRes.data.order_id),
               timestamp: new Date().toISOString(),
               source: "paystack_webhook_fallback",
             });
-            console.log(`✅ Created fallback order from webhook (frontend didn't create one)`);
+            console.log(`✅ Created fallback order from webhook`);
           }
         }
       } else {
@@ -526,5 +591,6 @@ app.listen(PORT, () => {
   console.log(`   Paystack key   : ${process.env.PAYSTACK_SECRET_KEY ? "✓ set" : "✗ MISSING"}`);
   console.log(`   Firebase DB    : ${db ? "✓ connected" : "✗ not connected"}`);
   console.log(`\n📌 Webhook endpoint: /paystack/webhook`);
-  console.log(`   Duplicate order protection: ENABLED\n`);
+  console.log(`   Duplicate order protection: ENABLED`);
+  console.log(`   Order status converter: ENABLED\n`);
 });
