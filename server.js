@@ -1,101 +1,47 @@
 // ============================================================
-//  DataFlow GH — Backend Server
-//  Integrates: HubNet API · Paystack · Firebase Admin
+//  DATEFLOW GH — UNIFIED BACKEND
+//  MTN → RemaData API  |  Telecel/AT → HubNetGH API
 // ============================================================
 
 require("dotenv").config();
 const express = require("express");
-const cors = require("cors");
 const axios = require("axios");
+const cors = require("cors");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Middleware ────────────────────────────────────────────────
-app.use(cors({ origin: "*" }));
+// ─────────────────────────────────────────────
+//  CONFIGURATION
+// ─────────────────────────────────────────────
 
-// Paystack webhook needs the RAW body for signature verification.
-app.use((req, res, next) => {
-  if (req.path === "/paystack/webhook") {
-    let raw = [];
-    req.on("data", chunk => raw.push(chunk));
-    req.on("end", () => {
-      req.rawBody = Buffer.concat(raw);
-      next();
-    });
-    req.on("error", next);
-  } else {
-    express.json()(req, res, next);
-  }
-});
+// RemaData Configuration (for MTN)
+const REMADATA_API_URL = "https://remadata.com/api";
+const REMADATA_API_KEY = process.env.REMADATA_API_KEY || "";
 
-// ── Firebase Admin Initialisation ────────────────────────────
-let db = null;
-let profitSettingsCache = null;
+// HubNetGH Configuration (for Telecel & AT)
+const HUBNET_BASE_URL = "https://hubnetgh.site/wp-json/hubnet-api/v1";
+const HUBNET_API_KEY = process.env.HUBNET_API_KEY || "";
 
-try {
-  const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-    ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
-    : null;
+// Paystack
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || "";
 
-  if (serviceAccount) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      databaseURL: process.env.FIREBASE_DATABASE_URL,
-    });
-    db = admin.database();
-    console.log("✅ Firebase Admin initialised");
-  } else {
-    console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON not set — DB writes disabled");
-  }
-} catch (err) {
-  console.error("❌ Firebase init error:", err.message);
-}
+// Security
+const DELIVER_SECRET = process.env.DELIVER_SECRET || "";
 
-// ── HubNet API client ─────────────────────────────────────────
-const hubnet = axios.create({
-  baseURL: "https://hubnetgh.site/wp-json/hubnet-api/v1",
-  headers: {
-    "Content-Type": "application/json",
-    "X-API-KEY": process.env.HUBNET_API_KEY,
-  },
-  timeout: 30000,
-});
+// In-memory dedup (prevents duplicate webhook processing)
+const processedRefs = new Set();
 
-// ── Paystack helper ───────────────────────────────────────────
-function verifyPaystackSignature(rawBody, signature) {
-  const secret = process.env.PAYSTACK_SECRET_KEY;
-  if (!secret || !rawBody || !signature) return false;
-  const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody);
-  const hash = crypto
-    .createHmac("sha512", secret)
-    .update(body)
-    .digest("hex");
-  return hash === signature;
-}
-
-// ── Utility Functions ─────────────────────────────────────────
-function resolveVolume(volumeInMB) {
-  const mb = Number(volumeInMB);
-  if (mb >= 1024) {
-    return String(Math.round(mb / 1024));
-  }
-  return String(mb);
-}
-
-const NETWORK_MAP = {
-  mtn: "mtn",
-  telecel: "telecel",
-  airteltigo: "airteltigo",
+// Network to provider mapping
+const NETWORK_PROVIDER = {
+  mtn: { name: "RemaData", config: { apiUrl: REMADATA_API_URL, apiKey: REMADATA_API_KEY } },
+  telecel: { name: "HubNetGH", config: { apiUrl: HUBNET_BASE_URL, apiKey: HUBNET_API_KEY } },
+  airteltigo: { name: "HubNetGH", config: { apiUrl: HUBNET_BASE_URL, apiKey: HUBNET_API_KEY } }
 };
 
-function resolveNetwork(networkType) {
-  return NETWORK_MAP[networkType?.toLowerCase()] || networkType || "mtn";
-}
-
-// ── HubNet Cost Prices ────────────────────────────────────────
+// HubNet static price list (fallback if API fails)
 const HUBNET_PRICES = {
   mtn: [
     { volume: "1", volumeInMB: 1024, price: 4.00 },
@@ -143,7 +89,94 @@ const HUBNET_PRICES = {
   ],
 };
 
-// ── Profit Settings ───────────────────────────────────────────
+// ─────────────────────────────────────────────
+//  FIREBASE ADMIN INIT
+// ─────────────────────────────────────────────
+let db = null;
+let profitSettingsCache = null;
+
+try {
+  const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+    ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
+    : null;
+
+  if (serviceAccount) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      databaseURL: process.env.FIREBASE_DATABASE_URL,
+    });
+    db = admin.database();
+    console.log("✅ Firebase Admin initialised");
+  } else {
+    console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON not set — DB writes disabled");
+  }
+} catch (err) {
+  console.error("❌ Firebase init error:", err.message);
+}
+
+// ─────────────────────────────────────────────
+//  MIDDLEWARE
+// ─────────────────────────────────────────────
+app.use(cors({ origin: "*" }));
+
+// Paystack webhook needs raw body
+app.use((req, res, next) => {
+  if (req.path === "/paystack/webhook") {
+    let raw = [];
+    req.on("data", chunk => raw.push(chunk));
+    req.on("end", () => {
+      req.rawBody = Buffer.concat(raw);
+      next();
+    });
+    req.on("error", next);
+  } else {
+    express.json()(req, res, next);
+  }
+});
+
+// Request logging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
+
+// Auth middleware for /deliver endpoint
+function requireApiKey(req, res, next) {
+  if (!DELIVER_SECRET) {
+    console.warn("⚠️ DELIVER_SECRET not configured — /deliver is unprotected!");
+    return res.status(500).json({ status: "error", message: "Server misconfiguration" });
+  }
+  const key = req.headers["x-api-key"] || req.body?.apiKey;
+  if (!key || key !== DELIVER_SECRET) {
+    console.warn(`🚫 Unauthorized /deliver attempt from ${req.ip}`);
+    return res.status(401).json({ status: "error", message: "Unauthorized" });
+  }
+  next();
+}
+
+// ─────────────────────────────────────────────
+//  HELPER FUNCTIONS
+// ─────────────────────────────────────────────
+
+function formatPhoneNumber(phone) {
+  let formatted = phone.replace(/\s+/g, "").replace(/-/g, "");
+  if (formatted.startsWith("0")) {
+    formatted = "233" + formatted.substring(1);
+  }
+  if (formatted.startsWith("+")) {
+    formatted = formatted.substring(1);
+  }
+  return formatted;
+}
+
+function resolveVolume(volumeInMB) {
+  const mb = Number(volumeInMB);
+  if (mb >= 1024) {
+    return String(Math.round(mb / 1024));
+  }
+  return String(mb);
+}
+
 async function getProfitSettings() {
   if (profitSettingsCache) return profitSettingsCache;
   if (!db) return { mode: "flat", flatAmount: 0 };
@@ -172,207 +205,111 @@ function applyProfit(costPrice, volumeInMB, network, settings) {
   return Math.ceil((costPrice + flat) * 20) / 20;
 }
 
-// ============================================================
-// ROUTES
-// ============================================================
+// ─────────────────────────────────────────────
+//  DELIVERY FUNCTIONS BY PROVIDER
+// ─────────────────────────────────────────────
 
-// Health check
-app.get("/health", async (_req, res) => {
-  res.json({
-    status: "OK",
-    service: "DataFlow GH Backend",
-    timestamp: new Date().toISOString(),
-    hubnetConfigured: !!process.env.HUBNET_API_KEY,
-    paystackConfigured: !!process.env.PAYSTACK_SECRET_KEY,
-    firebaseConfigured: !!db,
-  });
-});
+/**
+ * Deliver MTN data via RemaData API
+ */
+async function deliverViaRemaData(phone, volumeInMB, reference) {
+  const orderRef = reference || `DF-${Date.now()}`;
+  const formattedPhone = formatPhoneNumber(phone);
 
-// Get wallet balance
-app.get("/api/balance", async (_req, res) => {
-  try {
-    const { data } = await hubnet.get("/check_balance");
-    if (data.success) {
-      return res.json({
-        status: "success",
-        data: { balance: data.wallet_balance },
-      });
+  const payload = {
+    ref: orderRef,
+    phone: formattedPhone,
+    volumeInMB: Number(volumeInMB),
+    networkType: "mtn"
+  };
+
+  console.log(`📦 [RemaData] Delivering ${volumeInMB}MB MTN → ${phone} | Ref: ${orderRef}`);
+
+  const response = await axios.post(
+    `${REMADATA_API_URL}/buy-data`,
+    payload,
+    {
+      headers: {
+        "X-API-KEY": REMADATA_API_KEY,
+        "Content-Type": "application/json",
+      },
+      timeout: 30000,
     }
-    return res.status(502).json({
-      status: "error",
-      message: data.message || "Failed to fetch balance",
-    });
-  } catch (err) {
-    console.error("❌ /api/balance error:", err.message);
-    return res.status(500).json({ status: "error", message: err.message });
-  }
-});
+  );
 
-// Get bundles with profit applied
-app.get("/api/bundles", async (req, res) => {
-  const network = (req.query.network || "mtn").toLowerCase();
-  const baseBundles = HUBNET_PRICES[network] || HUBNET_PRICES.mtn;
-  try {
-    const settings = await getProfitSettings();
-    const bundles = baseBundles.map((b) => ({
-      ...b,
-      network,
-      costPrice: b.price,
-      price: applyProfit(b.price, b.volumeInMB, network, settings),
-    }));
-    return res.json({ status: "success", data: bundles });
-  } catch (err) {
-    console.error("❌ /api/bundles error:", err.message);
-    return res.json({
-      status: "success",
-      data: baseBundles.map(b => ({ ...b, network, costPrice: b.price })),
-    });
-  }
-});
+  const remaReference = response.data?.data?.reference || response.data?.reference || orderRef;
 
-// Delivery endpoint
-app.post("/deliver", async (req, res) => {
-  const { phone, networkType, volumeInMB, ref } = req.body;
+  return {
+    success: response.data?.status === "success",
+    reference: remaReference,
+    data: response.data,
+    provider: "RemaData"
+  };
+}
 
-  if (!phone || !networkType || !volumeInMB) {
-    return res.status(400).json({
-      status: "error",
-      message: "Missing required fields: phone, networkType, volumeInMB",
-    });
-  }
-
-  const network = resolveNetwork(networkType);
+/**
+ * Deliver Telecel/AT data via HubNetGH API
+ */
+async function deliverViaHubNet(phone, networkType, volumeInMB, reference) {
+  const network = networkType === "airteltigo" ? "airteltigo" : "telecel";
   const volume = resolveVolume(volumeInMB);
-  const requestId = ref || `DF-${Date.now()}`;
+  const requestId = reference || `DF-${Date.now()}`;
 
-  console.log(`📦 Delivering: ${volume}GB ${network} → ${phone} | ref: ${requestId}`);
+  console.log(`📦 [HubNetGH] Delivering ${volume}GB ${network} → ${phone} | Ref: ${requestId}`);
 
-  try {
-    const { data } = await hubnet.post("/place_order", {
+  const response = await axios.post(
+    `${HUBNET_BASE_URL}/place_order`,
+    {
       network,
       volume,
       customer_number: phone,
       quantity: 1,
       request_id: requestId,
-    });
-
-    if (data.success) {
-      console.log(`✅ HubNet order placed | order_id: ${data.order_id}`);
-      return res.json({
-        status: "success",
-        message: "Data bundle delivered successfully",
-        reference: String(data.order_id),
-        orderId: String(data.order_id),
-        total: data.total,
-        data: { order_id: data.order_id, total: data.total },
-      });
+    },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-KEY": HUBNET_API_KEY,
+      },
+      timeout: 30000,
     }
+  );
 
-    console.warn("⚠️ HubNet place_order failed:", data);
-    return res.status(502).json({
-      status: "error",
-      message: data.message || "HubNet order failed",
-    });
-  } catch (err) {
-    const hubnetMsg = err.response?.data?.message || err.response?.data || err.message;
-    console.error("❌ /deliver error:", hubnetMsg);
-    const statusCode = err.response?.status || 500;
-    return res.status(statusCode).json({
-      status: "error",
-      message: typeof hubnetMsg === "string" ? hubnetMsg : JSON.stringify(hubnetMsg),
-    });
-  }
-});
+  return {
+    success: response.data?.success === true,
+    reference: String(response.data?.order_id || requestId),
+    data: response.data,
+    provider: "HubNetGH"
+  };
+}
 
-// ============================================================
-// FIXED: Order Status endpoint - handles both Paystack refs and HubNet IDs
-// ============================================================
-app.get("/api/order-status/:reference", async (req, res) => {
-  const { reference } = req.params;
+/**
+ * Main delivery router - selects provider based on network type
+ */
+async function deliverData(phone, networkType, volumeInMB, reference = null) {
+  const provider = NETWORK_PROVIDER[networkType?.toLowerCase()];
 
-  if (!reference) {
-    return res.status(400).json({ status: "error", message: "Missing order reference" });
+  if (!provider) {
+    throw new Error(`Unsupported network type: ${networkType}`);
   }
 
-  // Determine if this is a Paystack reference (starts with DF or contains letters)
-  const isPaystackRef = reference.startsWith('DF') || /[A-Za-z]/.test(reference);
-  
-  let hubnetOrderId = reference;
-  
-  // If it's a Paystack reference, we need to look up the HubNet order ID from Firebase
-  if (isPaystackRef && db) {
-    try {
-      // Try to find by ref field first
-      let snapshot = await db.ref("orders").orderByChild("ref").equalTo(reference).once("value");
-      let orders = snapshot.val();
-      
-      if (!orders) {
-        // Try by orderId field
-        snapshot = await db.ref("orders").orderByChild("orderId").equalTo(reference).once("value");
-        orders = snapshot.val();
-      }
-      
-      if (orders) {
-        const orderKey = Object.keys(orders)[0];
-        const order = orders[orderKey];
-        if (order.hubnetRef || order.remaDataRef) {
-          hubnetOrderId = order.hubnetRef || order.remaDataRef;
-          console.log(`✅ Converted ${reference} to HubNet ID: ${hubnetOrderId}`);
-        } else {
-          console.log(`⚠️ No HubNet reference found for ${reference}`);
-          return res.status(404).json({ 
-            status: "error", 
-            message: "No HubNet order ID found for this reference" 
-          });
-        }
-      } else {
-        console.log(`⚠️ No order found for reference: ${reference}`);
-        return res.status(404).json({ status: "error", message: "Order not found" });
-      }
-    } catch (err) {
-      console.error("❌ Error looking up order:", err.message);
-      return res.status(500).json({ status: "error", message: "Database error" });
-    }
+  if (provider.name === "RemaData") {
+    return await deliverViaRemaData(phone, volumeInMB, reference);
+  } else {
+    return await deliverViaHubNet(phone, networkType, volumeInMB, reference);
   }
+}
 
-  try {
-    const { data } = await hubnet.get("/order_status", {
-      params: { order_id: hubnetOrderId },
-    });
+// ─────────────────────────────────────────────
+//  PAYSTACK WEBHOOK HANDLER
+// ─────────────────────────────────────────────
+function verifyPaystackSignature(rawBody, signature) {
+  if (!PAYSTACK_SECRET || !rawBody || !signature) return false;
+  const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody);
+  const hash = crypto.createHmac("sha512", PAYSTACK_SECRET).update(body).digest("hex");
+  return hash === signature;
+}
 
-    if (data.success) {
-      return res.json({
-        status: "success",
-        data: {
-          order_id: data.order_id,
-          status: data.status,
-          status_label: data.status_label,
-          customer_number: data.customer_number,
-          network: data.network,
-          volume: data.volume,
-          total: data.total,
-          created_at: data.created_at,
-        },
-      });
-    }
-
-    return res.status(404).json({
-      status: "error",
-      message: data.message || "Order not found",
-    });
-  } catch (err) {
-    const hubnetMsg = err.response?.data?.message || err.message;
-    console.error("❌ /api/order-status error:", hubnetMsg);
-    return res.status(err.response?.status || 500).json({
-      status: "error",
-      message: typeof hubnetMsg === "string" ? hubnetMsg : "Failed to fetch order status",
-    });
-  }
-});
-
-// ============================================================
-// FIXED: Paystack Webhook - correctly finds existing orders
-// ============================================================
 app.post("/paystack/webhook", async (req, res) => {
   const signature = req.headers["x-paystack-signature"];
 
@@ -390,10 +327,10 @@ app.post("/paystack/webhook", async (req, res) => {
     return res.status(400).json({ error: "Invalid JSON" });
   }
 
-  // Respond immediately to prevent Paystack timeouts
+  // Respond immediately
   res.status(200).json({ received: true });
 
-  // Process webhook asynchronously
+  // Process charge.success asynchronously
   if (event.event === "charge.success") {
     const { data } = event;
     const meta = data.metadata || {};
@@ -401,161 +338,282 @@ app.post("/paystack/webhook", async (req, res) => {
     const networkType = meta.networkType || meta.network_type;
     const volumeInMB = meta.volumeInMB || meta.volume_in_mb;
     const ref = data.reference;
-    const customerEmail = data.customer?.email;
     const amount = data.amount ? data.amount / 100 : 0;
-    const orderIdFromMeta = meta.orderId || meta.order_id;
 
-    console.log(`💳 Processing charge.success: ref=${ref}, phone=${phone}, volume=${volumeInMB}MB`);
-
-    if (!phone || !volumeInMB) {
-      console.warn(`⚠️ Missing delivery data: phone=${phone}, volume=${volumeInMB}`);
+    // Duplicate check
+    if (processedRefs.has(ref)) {
+      console.warn(`⚠️ Duplicate webhook ignored for ref: ${ref}`);
       return;
     }
 
+    if (!phone || !volumeInMB || !networkType) {
+      console.warn(`⚠️ Missing delivery data: phone=${phone}, volume=${volumeInMB}, network=${networkType}`);
+      return;
+    }
+
+    processedRefs.add(ref);
+
     try {
-      const network = resolveNetwork(networkType);
-      const volume = resolveVolume(volumeInMB);
-
-      // ============================================================
-      // IMPORTANT: Find existing order by multiple methods
-      // ============================================================
-      let existingOrderKey = null;
-      let existingOrderData = null;
-
-      if (db) {
-        // Method 1: Search by Paystack reference (ref field)
-        let snapshot = await db.ref("orders").orderByChild("ref").equalTo(ref).once("value");
-        let orders = snapshot.val();
+      console.log(`💳 Processing auto-delivery: ${networkType} ${volumeInMB}MB → ${phone}`);
+      const result = await deliverData(phone, networkType, Number(volumeInMB), ref);
+      
+      if (result.success) {
+        console.log(`✅ Auto-delivery successful via ${result.provider} | Ref: ${result.reference}`);
         
-        if (orders) {
-          existingOrderKey = Object.keys(orders)[0];
-          existingOrderData = orders[existingOrderKey];
-          console.log(`✅ Found order by ref: ${existingOrderKey}`);
-        }
-        
-        // Method 2: Search by orderId (DF-XXXX format)
-        if (!existingOrderKey && orderIdFromMeta) {
-          snapshot = await db.ref("orders").orderByChild("orderId").equalTo(orderIdFromMeta).once("value");
-          orders = snapshot.val();
-          if (orders) {
-            existingOrderKey = Object.keys(orders)[0];
-            existingOrderData = orders[existingOrderKey];
-            console.log(`✅ Found order by orderId: ${existingOrderKey}`);
-          }
-        }
-        
-        // Method 3: Search by scanning all orders (fallback)
-        if (!existingOrderKey) {
-          const allOrders = await db.ref("orders").once("value");
-          const allOrdersData = allOrders.val();
-          if (allOrdersData) {
-            for (const [key, order] of Object.entries(allOrdersData)) {
-              if (order.ref === ref || order.orderId === ref || order.orderId === orderIdFromMeta) {
-                existingOrderKey = key;
-                existingOrderData = order;
-                console.log(`✅ Found order by scanning: ${existingOrderKey}`);
-                break;
-              }
-            }
-          }
-        }
-      }
-
-      // Attempt delivery via HubNet
-      const hubnetRes = await hubnet.post("/place_order", {
-        network,
-        volume,
-        customer_number: phone,
-        quantity: 1,
-        request_id: ref,
-      });
-
-      if (hubnetRes.data.success) {
-        console.log(`✅ Auto-delivered: ${volume}GB to ${phone} | order_id: ${hubnetRes.data.order_id}`);
-
+        // Save to Firebase if available
         if (db) {
-          if (existingOrderKey) {
-            // UPDATE existing order - DO NOT CREATE NEW ONE
-            await db.ref(`orders/${existingOrderKey}`).update({
-              status: "completed",
-              deliveryStatus: "delivered",
-              remaDataRef: String(hubnetRes.data.order_id),
-              hubnetRef: String(hubnetRes.data.order_id),
-              deliveryTime: new Date().toISOString(),
-              autoDelivered: true,
-              webhookProcessed: true,
-              webhookProcessedAt: new Date().toISOString(),
-            });
-            console.log(`✅ Updated existing order: ${existingOrderKey} (NO DUPLICATE CREATED)`);
-          } else {
-            // ONLY CREATE NEW ORDER IF ABSOLUTELY NECESSARY
-            console.warn(`⚠️ No existing order found for ref: ${ref} - creating fallback order`);
-            const newOrderRef = db.ref("orders").push();
-            await newOrderRef.set({
-              orderId: `WEB-${Date.now()}`,
-              ref: ref,
-              phone: phone,
-              email: customerEmail || "webhook@paystack.com",
-              name: meta.name || "Webhook Order",
-              bundle: `${volume}GB`,
-              network: networkType || "mtn",
-              networkType: network,
-              volumeInMB: volumeInMB,
-              amount: amount,
-              grandTotalPaid: amount,
-              status: "completed",
-              deliveryStatus: "delivered",
-              remaDataRef: String(hubnetRes.data.order_id),
-              hubnetRef: String(hubnetRes.data.order_id),
-              timestamp: new Date().toISOString(),
-              source: "paystack_webhook_fallback",
-            });
-            console.log(`✅ Created fallback order from webhook`);
-          }
+          const orderData = {
+            ref: ref,
+            phone: phone,
+            networkType: networkType,
+            volumeInMB: volumeInMB,
+            amount: amount,
+            status: "completed",
+            provider: result.provider,
+            providerRef: result.reference,
+            timestamp: new Date().toISOString(),
+            source: "paystack_webhook"
+          };
+          await db.ref("transactions/" + ref).set(orderData);
         }
       } else {
-        console.error(`❌ HubNet delivery failed: ${hubnetRes.data.message}`);
-        
-        // Update existing order as failed if needed
-        if (db && existingOrderKey) {
-          await db.ref(`orders/${existingOrderKey}`).update({
-            status: "paid-pending-delivery",
-            deliveryError: hubnetRes.data.message || "Auto-delivery failed",
-            webhookProcessed: true,
-          });
-          console.log(`✅ Updated existing order as pending: ${existingOrderKey}`);
-        }
+        console.error(`❌ Auto-delivery failed: ${result.data?.message || "Unknown error"}`);
+        processedRefs.delete(ref); // Allow retry
       }
     } catch (err) {
-      console.error(`❌ Webhook delivery error: ${err.message}`);
+      console.error(`❌ Webhook delivery error:`, err.message);
+      processedRefs.delete(ref);
     }
   }
 });
 
-// Profit settings endpoints
-app.get("/api/profit-settings", async (_req, res) => {
+// ─────────────────────────────────────────────
+//  API ROUTES
+// ─────────────────────────────────────────────
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({
+    status: "OK",
+    service: "DataFlow GH Unified Backend",
+    timestamp: new Date().toISOString(),
+    providers: {
+      mtn: { provider: "RemaData", configured: !!REMADATA_API_KEY },
+      telecel: { provider: "HubNetGH", configured: !!HUBNET_API_KEY },
+      airteltigo: { provider: "HubNetGH", configured: !!HUBNET_API_KEY }
+    },
+    endpoints: ["/deliver", "/api/bundles", "/api/order-status/:ref", "/api/balance", "/paystack/webhook"]
+  });
+});
+
+// Get wallet balance (RemaData only)
+app.get("/api/balance", async (req, res) => {
   try {
-    const settings = await getProfitSettings();
-    const preview = {};
-    for (const [net, bundles] of Object.entries(HUBNET_PRICES)) {
-      preview[net] = bundles.map((b) => ({
-        ...b,
-        sellingPrice: applyProfit(b.price, b.volumeInMB, net, settings),
-        profit: parseFloat((applyProfit(b.price, b.volumeInMB, net, settings) - b.price).toFixed(2)),
+    const response = await axios.get(`${REMADATA_API_URL}/wallet-balance`, {
+      headers: { "X-API-KEY": REMADATA_API_KEY },
+      timeout: 10000
+    });
+    res.json(response.data);
+  } catch (err) {
+    console.error("Balance error:", err.response?.data || err.message);
+    res.status(500).json({ status: "error", message: "Failed to fetch balance" });
+  }
+});
+
+// Get bundles (unified - returns from correct provider)
+app.get("/api/bundles", async (req, res) => {
+  const network = (req.query.network || "mtn").toLowerCase();
+  
+  try {
+    let bundles = [];
+    
+    if (network === "mtn") {
+      // Fetch from RemaData
+      const response = await axios.get(`${REMADATA_API_URL}/bundles?network=mtn`, {
+        headers: { "X-API-KEY": REMADATA_API_KEY },
+        timeout: 10000
+      });
+      
+      if (response.data?.status === "success" && Array.isArray(response.data.data)) {
+        bundles = response.data.data.map(b => ({
+          volumeInMB: Number(b.volumeInMB),
+          volume: b.volume || `${b.volumeInMB / 1024}GB`,
+          price: parseFloat(b.price),
+          name: b.name,
+          network: "mtn"
+        }));
+      }
+    } else {
+      // Fetch from HubNet static prices
+      const baseBundles = HUBNET_PRICES[network] || HUBNET_PRICES.mtn;
+      const settings = await getProfitSettings();
+      bundles = baseBundles.map(b => ({
+        volumeInMB: b.volumeInMB,
+        volume: b.volume,
+        price: applyProfit(b.price, b.volumeInMB, network, settings),
+        costPrice: b.price,
+        network: network
       }));
     }
-    return res.json({ status: "success", settings, preview });
+    
+    res.json({ status: "success", data: bundles, provider: NETWORK_PROVIDER[network]?.name });
   } catch (err) {
-    return res.status(500).json({ status: "error", message: err.message });
+    console.error("Bundles error:", err.message);
+    // Fallback to static prices
+    const fallbackBundles = HUBNET_PRICES[network] || HUBNET_PRICES.mtn;
+    res.json({ 
+      status: "success", 
+      data: fallbackBundles.map(b => ({ ...b, network })),
+      provider: "fallback"
+    });
+  }
+});
+
+// Unified delivery endpoint (protected)
+app.post("/deliver", requireApiKey, async (req, res) => {
+  const { phone, networkType, volumeInMB, ref } = req.body;
+
+  if (!phone || !networkType || !volumeInMB) {
+    return res.status(400).json({
+      status: "error",
+      message: "Missing required fields: phone, networkType, volumeInMB"
+    });
+  }
+
+  // Validate network
+  const validNetworks = ["mtn", "telecel", "airteltigo"];
+  const normalizedNetwork = networkType.toLowerCase();
+  if (!validNetworks.includes(normalizedNetwork)) {
+    return res.status(400).json({
+      status: "error",
+      message: `Invalid network. Must be: ${validNetworks.join(", ")}`
+    });
+  }
+
+  // Validate phone
+  let cleanPhone = phone.replace(/\s+/g, "").replace(/-/g, "");
+  if (!/^(0|233)[0-9]{9}$/.test(cleanPhone)) {
+    return res.status(400).json({ status: "error", message: "Invalid phone number format" });
+  }
+
+  const volumeNum = Number(volumeInMB);
+  if (isNaN(volumeNum) || volumeNum <= 0) {
+    return res.status(400).json({ status: "error", message: "Invalid volumeInMB" });
+  }
+
+  try {
+    const result = await deliverData(cleanPhone, normalizedNetwork, volumeNum, ref);
+    
+    if (result.success) {
+      console.log(`✅ Delivery successful via ${result.provider}`);
+      return res.json({
+        status: "success",
+        message: "Data delivered successfully",
+        provider: result.provider,
+        reference: result.reference,
+        data: result.data
+      });
+    } else {
+      return res.status(500).json({
+        status: "error",
+        message: result.data?.message || "Delivery failed",
+        provider: result.provider
+      });
+    }
+  } catch (err) {
+    console.error("❌ /deliver error:", err.message);
+    const statusCode = err.response?.status || 500;
+    const errorMessage = err.response?.data?.message || err.message;
+    return res.status(statusCode).json({
+      status: "error",
+      message: errorMessage
+    });
+  }
+});
+
+// Unified order status endpoint
+app.get("/api/order-status/:reference", async (req, res) => {
+  const { reference } = req.params;
+  const { network } = req.query;
+
+  if (!reference) {
+    return res.status(400).json({ status: "error", message: "Reference is required" });
+  }
+
+  // Try each provider until we find the order
+  const providersToTry = network 
+    ? [NETWORK_PROVIDER[network.toLowerCase()]]
+    : Object.values(NETWORK_PROVIDER);
+
+  for (const provider of providersToTry) {
+    if (!provider) continue;
+
+    try {
+      if (provider.name === "RemaData") {
+        const response = await axios.get(`${REMADATA_API_URL}/order-status/${encodeURIComponent(reference)}`, {
+          headers: { "X-API-KEY": REMADATA_API_KEY },
+          timeout: 10000
+        });
+        
+        if (response.data?.status === "success") {
+          return res.json({
+            status: "success",
+            provider: provider.name,
+            data: response.data.data
+          });
+        }
+      } else if (provider.name === "HubNetGH") {
+        const response = await axios.get(`${HUBNET_BASE_URL}/order_status`, {
+          params: { order_id: reference },
+          headers: { "X-API-KEY": HUBNET_API_KEY },
+          timeout: 10000
+        });
+        
+        if (response.data?.success) {
+          return res.json({
+            status: "success",
+            provider: provider.name,
+            data: {
+              order_id: response.data.order_id,
+              status: response.data.status,
+              status_label: response.data.status_label,
+              customer_number: response.data.customer_number,
+              network: response.data.network,
+              volume: response.data.volume
+            }
+          });
+        }
+      }
+    } catch (err) {
+      // Continue to next provider
+      continue;
+    }
+  }
+
+  return res.status(404).json({
+    status: "error",
+    message: "Order not found with any provider"
+  });
+});
+
+// Profit settings endpoints
+app.get("/api/profit-settings", async (req, res) => {
+  try {
+    const settings = await getProfitSettings();
+    res.json({ status: "success", settings });
+  } catch (err) {
+    res.status(500).json({ status: "error", message: err.message });
   }
 });
 
 app.post("/api/profit-settings", async (req, res) => {
   const { mode, flatAmount, percentAmount, perBundle } = req.body;
   const validModes = ["flat", "percent", "perBundle"];
+  
   if (!validModes.includes(mode)) {
     return res.status(400).json({ status: "error", message: "mode must be flat | percent | perBundle" });
   }
+  
   const settings = {
     mode,
     flatAmount: parseFloat(flatAmount) || 0,
@@ -563,34 +621,65 @@ app.post("/api/profit-settings", async (req, res) => {
     perBundle: perBundle || {},
     updatedAt: new Date().toISOString(),
   };
+  
   try {
     if (db) await db.ref("system/profitSettings").set(settings);
     profitSettingsCache = settings;
-    console.log(`✅ Profit settings updated: mode=${mode}`);
-    return res.json({ status: "success", message: "Profit settings saved", settings });
+    res.json({ status: "success", message: "Profit settings saved", settings });
   } catch (err) {
-    return res.status(500).json({ status: "error", message: err.message });
+    res.status(500).json({ status: "error", message: err.message });
   }
 });
 
-app.post("/api/bundles/refresh", (_req, res) => {
-  profitSettingsCache = null;
-  console.log("🔄 Profit settings cache cleared");
-  res.json({ status: "success", message: "Cache cleared" });
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ status: "error", message: `Route ${req.method} ${req.url} not found` });
 });
 
-// Catch-all 404
-app.use((_req, res) => {
-  res.status(404).json({ status: "error", message: "Endpoint not found" });
+// Error handler
+app.use((err, req, res, next) => {
+  console.error("💥 Server error:", err.stack);
+  res.status(500).json({ status: "error", message: "Internal server error" });
 });
 
-// Start server
+// ─────────────────────────────────────────────
+//  START SERVER
+// ─────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n🚀 DataFlow GH Backend running on port ${PORT}`);
-  console.log(`   HubNet API key : ${process.env.HUBNET_API_KEY ? "✓ set" : "✗ MISSING"}`);
-  console.log(`   Paystack key   : ${process.env.PAYSTACK_SECRET_KEY ? "✓ set" : "✗ MISSING"}`);
-  console.log(`   Firebase DB    : ${db ? "✓ connected" : "✗ not connected"}`);
-  console.log(`\n📌 Webhook endpoint: /paystack/webhook`);
-  console.log(`   Duplicate order protection: ENABLED`);
-  console.log(`   Order status converter: ENABLED\n`);
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║   🚀 DataFlow GH UNIFIED Backend Running                      ║
+║   📡 Port: ${PORT}                                              ║
+║                                                               ║
+║   📦 Provider Routing:                                        ║
+║      MTN       → RemaData  ${REMADATA_API_KEY ? "✅" : "❌"}                    ║
+║      Telecel   → HubNetGH  ${HUBNET_API_KEY ? "✅" : "❌"}                    ║
+║      AT        → HubNetGH  ${HUBNET_API_KEY ? "✅" : "❌"}                    ║
+║                                                               ║
+║   💳 Paystack Webhook: ${PAYSTACK_SECRET ? "✅" : "❌"}                         ║
+║   🔒 /deliver protected: ${DELIVER_SECRET ? "✅" : "❌"}                       ║
+║   🔥 Firebase: ${db ? "✅" : "❌"}                                           ║
+║                                                               ║
+║   📮 Endpoints:                                               ║
+║      POST /deliver                 → Manual delivery 🔒       ║
+║      GET  /api/bundles             → Get bundles             ║
+║      GET  /api/order-status/:ref   → Check order status      ║
+║      GET  /api/balance             → RemaData wallet         ║
+║      POST /paystack/webhook        → Paystack auto-delivery  ║
+║      GET  /health                  → Health check            ║
+╚═══════════════════════════════════════════════════════════════╝
+  `);
 });
+
+// Keep-alive for production
+if (process.env.NODE_ENV === "production") {
+  setInterval(async () => {
+    try {
+      await axios.get(`http://localhost:${PORT}/health`, { timeout: 10000 });
+    } catch (err) {
+      console.error("⚠️ Health check failed:", err.message);
+    }
+  }, 4 * 60 * 1000);
+}
+
+module.exports = app;
