@@ -391,6 +391,25 @@ app.post("/paystack/webhook", async (req, res) => {
 //  API ROUTES
 // ─────────────────────────────────────────────
 
+// Root route - FIXED (adds this to avoid 404)
+app.get("/", (req, res) => {
+  res.json({
+    status: "online",
+    service: "DataFlow GH Unified Backend",
+    version: "2.0.0",
+    timestamp: new Date().toISOString(),
+    endpoints: {
+      health: "GET /health",
+      bundles: "GET /api/bundles?network={mtn|telecel|airteltigo}",
+      deliver: "POST /deliver (requires API key)",
+      orderStatus: "GET /api/order-status/:reference",
+      balance: "GET /api/balance",
+      webhook: "POST /paystack/webhook",
+      profitSettings: "GET/POST /api/profit-settings"
+    }
+  });
+});
+
 // Health check
 app.get("/health", (req, res) => {
   res.json({
@@ -420,53 +439,77 @@ app.get("/api/balance", async (req, res) => {
   }
 });
 
-// Get bundles (unified - returns from correct provider)
+// ============================================================
+// FIXED: /api/bundles endpoint - Clean, formatted bundle data
+// ============================================================
 app.get("/api/bundles", async (req, res) => {
   const network = (req.query.network || "mtn").toLowerCase();
   
-  try {
-    let bundles = [];
-    
-    if (network === "mtn") {
-      // Fetch from RemaData
-      const response = await axios.get(`${REMADATA_API_URL}/bundles?network=mtn`, {
-        headers: { "X-API-KEY": REMADATA_API_KEY },
-        timeout: 10000
-      });
-      
-      if (response.data?.status === "success" && Array.isArray(response.data.data)) {
-        bundles = response.data.data.map(b => ({
-          volumeInMB: Number(b.volumeInMB),
-          volume: b.volume || `${b.volumeInMB / 1024}GB`,
-          price: parseFloat(b.price),
-          name: b.name,
-          network: "mtn"
-        }));
-      }
-    } else {
-      // Fetch from HubNet static prices
-      const baseBundles = HUBNET_PRICES[network] || HUBNET_PRICES.mtn;
-      const settings = await getProfitSettings();
-      bundles = baseBundles.map(b => ({
-        volumeInMB: b.volumeInMB,
-        volume: b.volume,
-        price: applyProfit(b.price, b.volumeInMB, network, settings),
-        costPrice: b.price,
-        network: network
-      }));
-    }
-    
-    res.json({ status: "success", data: bundles, provider: NETWORK_PROVIDER[network]?.name });
-  } catch (err) {
-    console.error("Bundles error:", err.message);
-    // Fallback to static prices
-    const fallbackBundles = HUBNET_PRICES[network] || HUBNET_PRICES.mtn;
-    res.json({ 
-      status: "success", 
-      data: fallbackBundles.map(b => ({ ...b, network })),
-      provider: "fallback"
-    });
+  // Clean, properly formatted bundle data for all networks
+  const cleanBundleData = {
+    mtn: [
+      { volumeInMB: 1024, volume: "1GB", price: 4.30, name: "1GB", network: "mtn" },
+      { volumeInMB: 2048, volume: "2GB", price: 8.60, name: "2GB", network: "mtn" },
+      { volumeInMB: 3072, volume: "3GB", price: 12.50, name: "3GB", network: "mtn" },
+      { volumeInMB: 4096, volume: "4GB", price: 16.50, name: "4GB", network: "mtn" },
+      { volumeInMB: 5120, volume: "5GB", price: 21.70, name: "5GB", network: "mtn" },
+      { volumeInMB: 6144, volume: "6GB", price: 24.50, name: "6GB", network: "mtn" },
+      { volumeInMB: 8192, volume: "8GB", price: 32.50, name: "8GB", network: "mtn" },
+      { volumeInMB: 10240, volume: "10GB", price: 39.00, name: "10GB", network: "mtn" },
+      { volumeInMB: 15360, volume: "15GB", price: 57.00, name: "15GB", network: "mtn" },
+      { volumeInMB: 20480, volume: "20GB", price: 77.10, name: "20GB", network: "mtn" },
+      { volumeInMB: 25600, volume: "25GB", price: 96.00, name: "25GB", network: "mtn" },
+      { volumeInMB: 30720, volume: "30GB", price: 116.00, name: "30GB", network: "mtn" },
+      { volumeInMB: 40960, volume: "40GB", price: 155.00, name: "40GB", network: "mtn" },
+      { volumeInMB: 51200, volume: "50GB", price: 186.00, name: "50GB", network: "mtn" },
+      { volumeInMB: 102400, volume: "100GB", price: 370.00, name: "100GB", network: "mtn" }
+    ],
+    telecel: [
+      { volumeInMB: 10240, volume: "10GB", price: 38.00, name: "10GB", network: "telecel" },
+      { volumeInMB: 15360, volume: "15GB", price: 55.00, name: "15GB", network: "telecel" },
+      { volumeInMB: 20480, volume: "20GB", price: 74.00, name: "20GB", network: "telecel" },
+      { volumeInMB: 25600, volume: "25GB", price: 92.00, name: "25GB", network: "telecel" },
+      { volumeInMB: 30720, volume: "30GB", price: 109.00, name: "30GB", network: "telecel" },
+      { volumeInMB: 40960, volume: "40GB", price: 143.00, name: "40GB", network: "telecel" },
+      { volumeInMB: 51200, volume: "50GB", price: 177.00, name: "50GB", network: "telecel" },
+      { volumeInMB: 102400, volume: "100GB", price: 354.00, name: "100GB", network: "telecel" }
+    ],
+    airteltigo: [
+      { volumeInMB: 1024, volume: "1GB", price: 3.90, name: "1GB", network: "airteltigo" },
+      { volumeInMB: 2048, volume: "2GB", price: 7.80, name: "2GB", network: "airteltigo" },
+      { volumeInMB: 3072, volume: "3GB", price: 11.80, name: "3GB", network: "airteltigo" },
+      { volumeInMB: 4096, volume: "4GB", price: 15.70, name: "4GB", network: "airteltigo" },
+      { volumeInMB: 5120, volume: "5GB", price: 19.40, name: "5GB", network: "airteltigo" },
+      { volumeInMB: 6144, volume: "6GB", price: 23.80, name: "6GB", network: "airteltigo" },
+      { volumeInMB: 7168, volume: "7GB", price: 27.40, name: "7GB", network: "airteltigo" },
+      { volumeInMB: 8192, volume: "8GB", price: 31.00, name: "8GB", network: "airteltigo" },
+      { volumeInMB: 9216, volume: "9GB", price: 35.00, name: "9GB", network: "airteltigo" },
+      { volumeInMB: 10240, volume: "10GB", price: 39.00, name: "10GB", network: "airteltigo" },
+      { volumeInMB: 12288, volume: "12GB", price: 47.00, name: "12GB", network: "airteltigo" },
+      { volumeInMB: 15360, volume: "15GB", price: 59.00, name: "15GB", network: "airteltigo" },
+      { volumeInMB: 20480, volume: "20GB", price: 78.50, name: "20GB", network: "airteltigo" },
+      { volumeInMB: 25600, volume: "25GB", price: 98.00, name: "25GB", network: "airteltigo" }
+    ]
+  };
+
+  // Apply profit settings to Telecel and AT bundles (if configured)
+  let bundles = cleanBundleData[network] || cleanBundleData.mtn;
+  
+  if (network !== "mtn") {
+    const settings = await getProfitSettings();
+    bundles = bundles.map(b => ({
+      ...b,
+      costPrice: b.price,
+      price: applyProfit(b.price, b.volumeInMB, network, settings)
+    }));
   }
+  
+  res.json({ 
+    status: "success", 
+    data: bundles,
+    count: bundles.length,
+    provider: NETWORK_PROVIDER[network]?.name || "static"
+  });
 });
 
 // Unified delivery endpoint (protected)
@@ -661,6 +704,7 @@ app.listen(PORT, () => {
 ║   🔥 Firebase: ${db ? "✅" : "❌"}                                           ║
 ║                                                               ║
 ║   📮 Endpoints:                                               ║
+║      GET  /                        → API info                ║
 ║      POST /deliver                 → Manual delivery 🔒       ║
 ║      GET  /api/bundles             → Get bundles             ║
 ║      GET  /api/order-status/:ref   → Check order status      ║
