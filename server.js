@@ -301,7 +301,7 @@ async function deliverData(phone, networkType, volumeInMB, reference = null) {
 }
 
 // ─────────────────────────────────────────────
-//  PAYSTACK WEBHOOK HANDLER
+//  PAYSTACK WEBHOOK HANDLER - FIXED (Direct call, no HTTP)
 // ─────────────────────────────────────────────
 function verifyPaystackSignature(rawBody, signature) {
   if (!PAYSTACK_SECRET || !rawBody || !signature) return false;
@@ -327,63 +327,68 @@ app.post("/paystack/webhook", async (req, res) => {
     return res.status(400).json({ error: "Invalid JSON" });
   }
 
-  // Respond immediately
+  // Respond immediately to Paystack (must respond within 5 seconds)
   res.status(200).json({ received: true });
 
-  // Process charge.success asynchronously
-  if (event.event === "charge.success") {
-    const { data } = event;
-    const meta = data.metadata || {};
-    const phone = meta.phone || meta.customer_phone;
-    const networkType = meta.networkType || meta.network_type;
-    const volumeInMB = meta.volumeInMB || meta.volume_in_mb;
-    const ref = data.reference;
-    const amount = data.amount ? data.amount / 100 : 0;
+  // Only process charge.success events
+  if (event.event !== "charge.success") {
+    console.log(`📝 Webhook event ignored: ${event.event}`);
+    return;
+  }
 
-    // Duplicate check
-    if (processedRefs.has(ref)) {
-      console.warn(`⚠️ Duplicate webhook ignored for ref: ${ref}`);
-      return;
-    }
+  const { data } = event;
+  const meta = data.metadata || {};
+  const phone = meta.phone || meta.customer_phone;
+  const networkType = meta.networkType || meta.network_type;
+  const volumeInMB = meta.volumeInMB || meta.volume_in_mb;
+  const ref = data.reference;
+  const amount = data.amount ? data.amount / 100 : 0;
 
-    if (!phone || !volumeInMB || !networkType) {
-      console.warn(`⚠️ Missing delivery data: phone=${phone}, volume=${volumeInMB}, network=${networkType}`);
-      return;
-    }
+  // Validate required fields
+  if (!phone || !volumeInMB || !networkType) {
+    console.warn(`⚠️ Missing delivery data: phone=${phone}, volume=${volumeInMB}, network=${networkType}`);
+    return;
+  }
 
-    processedRefs.add(ref);
+  // Prevent duplicate processing
+  if (processedRefs.has(ref)) {
+    console.warn(`⚠️ Duplicate webhook ignored for ref: ${ref}`);
+    return;
+  }
+  processedRefs.add(ref);
 
-    try {
-      console.log(`💳 Processing auto-delivery: ${networkType} ${volumeInMB}MB → ${phone}`);
-      const result = await deliverData(phone, networkType, Number(volumeInMB), ref);
+  try {
+    console.log(`💳 Processing auto-delivery: ${networkType} ${volumeInMB}MB → ${phone} | Ref: ${ref}`);
+    
+    // ✅ FIXED: Direct function call - NO HTTP request to /deliver
+    const result = await deliverData(phone, networkType, Number(volumeInMB), ref);
+    
+    if (result.success) {
+      console.log(`✅ Auto-delivery successful via ${result.provider} | Provider Ref: ${result.reference}`);
       
-      if (result.success) {
-        console.log(`✅ Auto-delivery successful via ${result.provider} | Ref: ${result.reference}`);
-        
-        // Save to Firebase if available
-        if (db) {
-          const orderData = {
-            ref: ref,
-            phone: phone,
-            networkType: networkType,
-            volumeInMB: volumeInMB,
-            amount: amount,
-            status: "completed",
-            provider: result.provider,
-            providerRef: result.reference,
-            timestamp: new Date().toISOString(),
-            source: "paystack_webhook"
-          };
-          await db.ref("transactions/" + ref).set(orderData);
-        }
-      } else {
-        console.error(`❌ Auto-delivery failed: ${result.data?.message || "Unknown error"}`);
-        processedRefs.delete(ref); // Allow retry
+      // Save to Firebase if available
+      if (db) {
+        const orderData = {
+          ref: ref,
+          phone: phone,
+          networkType: networkType,
+          volumeInMB: volumeInMB,
+          amount: amount,
+          status: "completed",
+          provider: result.provider,
+          providerRef: result.reference,
+          timestamp: new Date().toISOString(),
+          source: "paystack_webhook"
+        };
+        await db.ref("transactions/" + ref).set(orderData).catch(e => console.warn("Firebase save error:", e));
       }
-    } catch (err) {
-      console.error(`❌ Webhook delivery error:`, err.message);
-      processedRefs.delete(ref);
+    } else {
+      console.error(`❌ Auto-delivery failed: ${result.data?.message || "Unknown error"}`);
+      processedRefs.delete(ref); // Allow manual retry
     }
+  } catch (err) {
+    console.error(`❌ Webhook delivery error:`, err.message);
+    processedRefs.delete(ref); // Allow retry
   }
 });
 
@@ -391,7 +396,7 @@ app.post("/paystack/webhook", async (req, res) => {
 //  API ROUTES
 // ─────────────────────────────────────────────
 
-// Root route - FIXED (adds this to avoid 404)
+// Root route
 app.get("/", (req, res) => {
   res.json({
     status: "online",
@@ -440,9 +445,7 @@ app.get("/api/balance", async (req, res) => {
   }
 });
 
-// ============================================================
-// NEW: HUBNET WALLET BALANCE ENDPOINT
-// ============================================================
+// HubNet wallet balance endpoint
 app.get("/api/hubnet/balance", async (req, res) => {
   try {
     console.log("💰 Fetching HubNet wallet balance...");
@@ -473,7 +476,6 @@ app.get("/api/hubnet/balance", async (req, res) => {
   } catch (err) {
     console.error("❌ HubNet balance error:", err.response?.data || err.message);
     
-    // Return a graceful response
     return res.status(200).json({
       status: "info",
       balance: null,
@@ -483,13 +485,10 @@ app.get("/api/hubnet/balance", async (req, res) => {
   }
 });
 
-// ============================================================
-// FIXED: /api/bundles endpoint - Clean, formatted bundle data
-// ============================================================
+// Bundles endpoint
 app.get("/api/bundles", async (req, res) => {
   const network = (req.query.network || "mtn").toLowerCase();
   
-  // Clean, properly formatted bundle data for all networks
   const cleanBundleData = {
     mtn: [
       { volumeInMB: 1024, volume: "1GB", price: 4.30, name: "1GB", network: "mtn" },
@@ -536,7 +535,6 @@ app.get("/api/bundles", async (req, res) => {
     ]
   };
 
-  // Apply profit settings to Telecel and AT bundles (if configured)
   let bundles = cleanBundleData[network] || cleanBundleData.mtn;
   
   if (network !== "mtn") {
@@ -556,7 +554,7 @@ app.get("/api/bundles", async (req, res) => {
   });
 });
 
-// Unified delivery endpoint (protected)
+// Unified delivery endpoint (protected - for manual/admin use)
 app.post("/deliver", requireApiKey, async (req, res) => {
   const { phone, networkType, volumeInMB, ref } = req.body;
 
@@ -567,7 +565,6 @@ app.post("/deliver", requireApiKey, async (req, res) => {
     });
   }
 
-  // Validate network
   const validNetworks = ["mtn", "telecel", "airteltigo"];
   const normalizedNetwork = networkType.toLowerCase();
   if (!validNetworks.includes(normalizedNetwork)) {
@@ -577,7 +574,6 @@ app.post("/deliver", requireApiKey, async (req, res) => {
     });
   }
 
-  // Validate phone
   let cleanPhone = phone.replace(/\s+/g, "").replace(/-/g, "");
   if (!/^(0|233)[0-9]{9}$/.test(cleanPhone)) {
     return res.status(400).json({ status: "error", message: "Invalid phone number format" });
@@ -627,7 +623,6 @@ app.get("/api/order-status/:reference", async (req, res) => {
     return res.status(400).json({ status: "error", message: "Reference is required" });
   }
 
-  // Try each provider until we find the order
   const providersToTry = network 
     ? [NETWORK_PROVIDER[network.toLowerCase()]]
     : Object.values(NETWORK_PROVIDER);
@@ -672,7 +667,6 @@ app.get("/api/order-status/:reference", async (req, res) => {
         }
       }
     } catch (err) {
-      // Continue to next provider
       continue;
     }
   }
