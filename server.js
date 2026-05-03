@@ -404,6 +404,7 @@ app.get("/", (req, res) => {
       deliver: "POST /deliver (requires API key)",
       orderStatus: "GET /api/order-status/:reference",
       balance: "GET /api/balance",
+      hubnetBalance: "GET /api/hubnet/balance",
       webhook: "POST /paystack/webhook",
       profitSettings: "GET/POST /api/profit-settings"
     }
@@ -421,7 +422,7 @@ app.get("/health", (req, res) => {
       telecel: { provider: "HubNetGH", configured: !!HUBNET_API_KEY },
       airteltigo: { provider: "HubNetGH", configured: !!HUBNET_API_KEY }
     },
-    endpoints: ["/deliver", "/api/bundles", "/api/order-status/:ref", "/api/balance", "/paystack/webhook"]
+    endpoints: ["/deliver", "/api/bundles", "/api/order-status/:ref", "/api/balance", "/api/hubnet/balance", "/paystack/webhook"]
   });
 });
 
@@ -436,6 +437,49 @@ app.get("/api/balance", async (req, res) => {
   } catch (err) {
     console.error("Balance error:", err.response?.data || err.message);
     res.status(500).json({ status: "error", message: "Failed to fetch balance" });
+  }
+});
+
+// ============================================================
+// NEW: HUBNET WALLET BALANCE ENDPOINT
+// ============================================================
+app.get("/api/hubnet/balance", async (req, res) => {
+  try {
+    console.log("💰 Fetching HubNet wallet balance...");
+    
+    const response = await axios.get(`${HUBNET_BASE_URL}/check_balance`, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-KEY": HUBNET_API_KEY
+      },
+      timeout: 15000
+    });
+    
+    console.log("HubNet balance response:", response.data);
+    
+    if (response.data && response.data.success) {
+      return res.json({
+        status: "success",
+        balance: response.data.wallet_balance || 0,
+        currency: "GHS",
+        message: "Balance retrieved successfully"
+      });
+    } else {
+      return res.status(502).json({
+        status: "error",
+        message: response.data?.message || "Failed to fetch HubNet balance"
+      });
+    }
+  } catch (err) {
+    console.error("❌ HubNet balance error:", err.response?.data || err.message);
+    
+    // Return a graceful response
+    return res.status(200).json({
+      status: "info",
+      balance: null,
+      message: "Unable to fetch balance. Please check HubNet dashboard.",
+      dashboardUrl: "https://hubnetgh.site"
+    });
   }
 });
 
@@ -709,6 +753,7 @@ app.listen(PORT, () => {
 ║      GET  /api/bundles             → Get bundles             ║
 ║      GET  /api/order-status/:ref   → Check order status      ║
 ║      GET  /api/balance             → RemaData wallet         ║
+║      GET  /api/hubnet/balance      → HubNet wallet           ║
 ║      POST /paystack/webhook        → Paystack auto-delivery  ║
 ║      GET  /health                  → Health check            ║
 ╚═══════════════════════════════════════════════════════════════╝
