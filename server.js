@@ -151,14 +151,23 @@ async function deliverViaRemaData(phone, volumeInMB, reference) {
   const orderRef = reference || `DF-${Date.now()}`;
   const formattedPhone = formatPhoneNumber(phone);
 
+  // FIX: Convert binary MB to RemaData's decimal MB standard
+  const REMA_MB_MAP = {
+    1024: 1000, 2048: 2000, 3072: 3000, 4096: 4000,
+    5120: 5000, 6144: 6000, 8192: 8000, 10240: 10000,
+    15360: 15000, 20480: 20000, 25600: 25000, 30720: 30000,
+    40960: 40000, 51200: 50000, 102400: 100000
+  };
+  const remaMB = REMA_MB_MAP[Number(volumeInMB)] || Number(volumeInMB);
+
   const payload = {
     ref: orderRef,
     phone: formattedPhone,
-    volumeInMB: Number(volumeInMB),
+    volumeInMB: remaMB,
     networkType: "mtn"
   };
 
-  console.log(`📦 [RemaData] Delivering ${volumeInMB}MB MTN → ${phone}`);
+  console.log(`📦 [RemaData] Delivering ${remaMB}MB MTN → ${phone}`);
 
   const response = await axios.post(`${REMADATA_API_URL}/buy-data`, payload, {
     headers: { "X-API-KEY": REMADATA_API_KEY, "Content-Type": "application/json" },
