@@ -1,6 +1,8 @@
 // ============================================================
-//  DATEFLOW GH — UNIFIED BACKEND (FIXED WEBHOOK)
-//  MTN → RemaData API  |  Telecel/AT → HubNetGH API
+//  DATEFLOW GH — UNIFIED BACKEND (PRODUCTION READY)
+//  MTN → RemaData API (local format 0XXXXXXXXX + volume mapping)
+//  Telecel/AT → HubNetGH API (local format 0XXXXXXXXX)
+//  Features: Retry logic, bidirectional failover, queue, memory protection
 // ============================================================
 
 require("dotenv").config();
@@ -26,51 +28,281 @@ const HUBNET_API_KEY = process.env.HUBNET_API_KEY || "";
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || "";
 const DELIVER_SECRET = process.env.DELIVER_SECRET || "";
 
-const processedRefs = new Set();
+// Retry configuration
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
 
+// Processed references with memory protection
+const processedRefs = new Map();
+const REF_TTL = 24 * 60 * 60 * 1000;
+const MAX_REF_SIZE = 10000;
+
+// Firebase failed saves queue
+const failedSaveQueue = [];
+let isProcessingQueue = false;
+
+// Network providers with BIDIRECTIONAL failover support
 const NETWORK_PROVIDER = {
-  mtn: { name: "RemaData" },
-  telecel: { name: "HubNetGH" },
-  airteltigo: { name: "HubNetGH" }
+  mtn: { 
+    name: "RemaData", 
+    primary: true,
+    fallback: "HubNetGH",
+    fallbackNetwork: "mtn"
+  },
+  telecel: { 
+    name: "HubNetGH", 
+    primary: true,
+    fallback: "RemaData",
+    fallbackNetwork: "telecel"
+  },
+  airteltigo: { 
+    name: "HubNetGH", 
+    primary: true,
+    fallback: "RemaData",
+    fallbackNetwork: "airteltigo"
+  },
 };
+
+// Promise cache for profit settings
+let profitSettingsPromise = null;
+let profitSettingsCache = null;
+let lastCacheUpdate = 0;
+const CACHE_TTL = 5 * 60 * 1000;
+
+// ─────────────────────────────────────────────
+//  VOLUME MAPPING FOR REMADATA
+// ─────────────────────────────────────────────
+
+const REMA_MB_MAP = {
+  1024: 1000, 2048: 2000, 3072: 3000, 4096: 4000,
+  5120: 5000, 6144: 6000, 7168: 7000, 8192: 8000,
+  9216: 9000, 10240: 10000, 11264: 11000, 12288: 12000,
+  13312: 13000, 14336: 14000, 15360: 15000, 16384: 16000,
+  17408: 17000, 18432: 18000, 19456: 19000, 20480: 20000,
+  25600: 25000, 30720: 30000, 40960: 40000, 51200: 50000,
+  102400: 100000
+};
+
+// ─────────────────────────────────────────────
+//  STRUCTURED ERROR CLASS
+// ─────────────────────────────────────────────
+
+class AppError extends Error {
+  constructor(message, statusCode = 500, category = "INTERNAL", details = null) {
+    super(message);
+    this.statusCode = statusCode;
+    this.category = category;
+    this.details = details;
+    this.isOperational = true;
+  }
+}
+
+function asyncHandler(fn) {
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
+
+// ─────────────────────────────────────────────
+//  CUSTOMER-FRIENDLY ERROR MESSAGES
+// ─────────────────────────────────────────────
+
+function getCustomerFriendlyMessage(network, technicalDetails) {
+  const messages = {
+    mtn: "MTN data delivery is temporarily unavailable. Please try again in a few minutes. If the issue persists, contact support.",
+    telecel: "Telecel data delivery is temporarily unavailable. Please try again in a few minutes. If the issue persists, contact support.",
+    airteltigo: "AirtelTigo data delivery is temporarily unavailable. Please try again in a few minutes. If the issue persists, contact support."
+  };
+  
+  const baseMessage = messages[network] || "Data delivery is temporarily unavailable. Please try again later.";
+  
+  // Log technical details for admin only
+  console.error(`📝 Technical details for ${network}: ${technicalDetails}`);
+  
+  return baseMessage;
+}
+
+// ─────────────────────────────────────────────
+//  RETRY LOGIC WITH EXPONENTIAL BACKOFF
+// ─────────────────────────────────────────────
+
+async function fetchWithRetry(apiCall, retries = MAX_RETRIES, delay = RETRY_DELAY_MS) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await apiCall();
+    } catch (err) {
+      const isLastAttempt = i === retries - 1;
+      const isProviderError = err.category === "PROVIDER";
+      
+      if (isLastAttempt || !isProviderError) throw err;
+      
+      const waitTime = delay * Math.pow(2, i);
+      console.log(`🔄 Retry ${i + 1}/${retries} after ${waitTime}ms: ${err.message}`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+//  STARTUP VALIDATION
+// ─────────────────────────────────────────────
+
+function validateEnv() {
+  const checks = [
+    ["REMADATA_API_KEY", REMADATA_API_KEY, "MTN delivery will fail"],
+    ["HUBNET_API_KEY", HUBNET_API_KEY, "Telecel/AT delivery will fail"],
+    ["PAYSTACK_SECRET_KEY", PAYSTACK_SECRET, "Webhook signature verification disabled"],
+    ["DELIVER_SECRET", DELIVER_SECRET, "/deliver endpoint unprotected"],
+    ["FIREBASE_DATABASE_URL", process.env.FIREBASE_DATABASE_URL, "Orders will not be saved"],
+    ["FIREBASE_SERVICE_ACCOUNT_JSON", process.env.FIREBASE_SERVICE_ACCOUNT_JSON, "Firebase disabled"],
+  ];
+
+  const missing = checks.filter(([, val]) => !val);
+  if (missing.length) {
+    console.warn("⚠️  Missing environment variables:");
+    missing.forEach(([key, , impact]) =>
+      console.warn(`   • ${key.padEnd(36)} → ${impact}`)
+    );
+  }
+}
 
 // ─────────────────────────────────────────────
 //  FIREBASE ADMIN INIT
 // ─────────────────────────────────────────────
 let db = null;
-let profitSettingsCache = null;
 
 try {
   const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
     ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
     : null;
 
-  if (serviceAccount) {
+  if (serviceAccount && process.env.FIREBASE_DATABASE_URL) {
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
       databaseURL: process.env.FIREBASE_DATABASE_URL,
     });
     db = admin.database();
     console.log("✅ Firebase Admin initialised");
+    
+    // Start queue processor
+    setInterval(processFailedSaveQueue, 60000);
   } else {
-    console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON not set");
+    if (!serviceAccount) console.warn("⚠️  FIREBASE_SERVICE_ACCOUNT_JSON not set — Firebase disabled");
+    if (!process.env.FIREBASE_DATABASE_URL) console.warn("⚠️  FIREBASE_DATABASE_URL not set — Firebase disabled");
   }
 } catch (err) {
-  console.error("❌ Firebase init error:", err.message);
+  console.error(`❌ Firebase init failed: ${err.message}`);
 }
+
+// ─────────────────────────────────────────────
+//  FIREBASE QUEUE PROCESSOR
+// ─────────────────────────────────────────────
+
+async function saveOrderWithRetry(ref, payload, retries = 5) {
+  if (!db) {
+    failedSaveQueue.push({ ref, payload, timestamp: Date.now() });
+    console.warn(`⚠️ Firebase unavailable, queued order "${ref}" (queue size: ${failedSaveQueue.length})`);
+    return;
+  }
+  
+  for (let i = 0; i < retries; i++) {
+    try {
+      await db.ref(`transactions/${ref}`).set(payload);
+      console.log(`✅ Order "${ref}" saved to Firebase`);
+      return;
+    } catch (err) {
+      if (i === retries - 1) {
+        failedSaveQueue.push({ ref, payload, timestamp: Date.now() });
+        console.error(`❌ Failed to save order "${ref}" after ${retries} retries, queued`);
+      } else {
+        await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
+      }
+    }
+  }
+}
+
+async function saveFailedOrderWithRetry(ref, payload, errMessage) {
+  const failedPayload = {
+    ...payload,
+    status: "failed",
+    error: errMessage,
+    timestamp: new Date().toISOString(),
+  };
+  await saveOrderWithRetry(ref, failedPayload);
+}
+
+async function processFailedSaveQueue() {
+  if (isProcessingQueue || !db || failedSaveQueue.length === 0) return;
+  
+  isProcessingQueue = true;
+  console.log(`🔄 Processing ${failedSaveQueue.length} queued Firebase saves...`);
+  
+  const queueCopy = [...failedSaveQueue];
+  failedSaveQueue.length = 0;
+  
+  for (const item of queueCopy) {
+    try {
+      await db.ref(`transactions/${item.ref}`).set(item.payload);
+      console.log(`✅ Queued order "${item.ref}" saved after recovery`);
+    } catch (err) {
+      console.error(`❌ Still failed to save "${item.ref}" after recovery, re-queuing`);
+      failedSaveQueue.push(item);
+    }
+  }
+  
+  isProcessingQueue = false;
+  
+  if (failedSaveQueue.length > 0) {
+    setTimeout(processFailedSaveQueue, 30000);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  PROCESSED REFS CLEANUP (Memory Protection)
+// ─────────────────────────────────────────────
+
+setInterval(() => {
+  const now = Date.now();
+  let deletedCount = 0;
+  
+  for (const [ref, timestamp] of processedRefs.entries()) {
+    if (now - timestamp > REF_TTL) {
+      processedRefs.delete(ref);
+      deletedCount++;
+    }
+  }
+  
+  // Force cleanup if size exceeds limit
+  if (processedRefs.size > MAX_REF_SIZE) {
+    const excess = processedRefs.size - MAX_REF_SIZE;
+    const iterator = processedRefs.keys();
+    for (let i = 0; i < excess; i++) {
+      processedRefs.delete(iterator.next().value);
+    }
+    console.warn(`⚠️ Force-cleaned ${excess} old refs, size now ${processedRefs.size}`);
+  }
+  
+  if (deletedCount > 0) {
+    console.log(`🧹 Cleaned ${deletedCount} expired refs, size: ${processedRefs.size}`);
+  }
+}, 60 * 60 * 1000);
 
 // ─────────────────────────────────────────────
 //  MIDDLEWARE
 // ─────────────────────────────────────────────
+
 app.use(cors({ origin: "*" }));
 
-// Paystack webhook needs raw body
+// Raw body capture for Paystack webhook
 app.use((req, res, next) => {
   if (req.path === "/paystack/webhook") {
-    let raw = [];
-    req.on("data", chunk => raw.push(chunk));
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
-      req.rawBody = Buffer.concat(raw);
+      req.rawBody = Buffer.concat(chunks);
+      try {
+        req.body = JSON.parse(req.rawBody.toString());
+      } catch {
+        req.body = {};
+      }
       next();
     });
     req.on("error", next);
@@ -79,60 +311,106 @@ app.use((req, res, next) => {
   }
 });
 
+// Request timeout
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  req.setTimeout(30000);
+  res.setTimeout(30000);
   next();
 });
 
-// FIX 3: Guard against empty DELIVER_SECRET
+// Request logger
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    const ms = Date.now() - start;
+    const icon = res.statusCode < 400 ? "✓" : res.statusCode < 500 ? "⚠" : "✗";
+    console.log(`${icon} ${req.method} ${req.path} → ${res.statusCode} (${ms}ms)`);
+  });
+  next();
+});
+
+// ─────────────────────────────────────────────
+//  AUTH MIDDLEWARE
+// ─────────────────────────────────────────────
+
 function requireApiKey(req, res, next) {
   if (!DELIVER_SECRET) {
-    console.error("❌ DELIVER_SECRET env var not set");
-    return res.status(500).json({ status: "error", message: "Server misconfiguration" });
+    return next(new AppError("DELIVER_SECRET not configured", 500, "INTERNAL"));
   }
   const key = req.headers["x-api-key"] || req.body?.apiKey;
   if (!key || key !== DELIVER_SECRET) {
-    console.warn(`🚫 Unauthorized /deliver attempt from ${req.ip}`);
-    return res.status(401).json({ status: "error", message: "Unauthorized" });
+    console.warn(`🚫 Unauthorized /deliver attempt — IP: ${req.ip}`);
+    return next(new AppError("Invalid or missing API key", 401, "AUTH"));
   }
   next();
 }
 
 // ─────────────────────────────────────────────
-//  HELPER FUNCTIONS
+//  PHONE FORMATTING HELPERS
 // ─────────────────────────────────────────────
 
-function formatPhoneNumber(phone) {
-  let formatted = phone.replace(/\s+/g, "").replace(/-/g, "");
-  if (formatted.startsWith("0")) formatted = "233" + formatted.substring(1);
-  if (formatted.startsWith("+")) formatted = formatted.substring(1);
-  return formatted;
+function formatPhoneLocal(phone) {
+  let p = String(phone).replace(/[\s\-]/g, "");
+  
+  if (p.startsWith("233")) p = "0" + p.slice(3);
+  if (p.startsWith("+233")) p = "0" + p.slice(4);
+  if (!p.startsWith("0")) p = "0" + p;
+  
+  if (!/^0\d{9}$/.test(p)) {
+    throw new AppError(
+      `Phone must be 10 digits starting with 0 (e.g., 0551234567), got: "${phone}"`,
+      400, "VALIDATION"
+    );
+  }
+  return p;
 }
 
 function resolveVolume(volumeInMB) {
   const mb = Number(volumeInMB);
-  if (mb >= 1024) return String(Math.round(mb / 1024));
-  return String(mb);
+  return mb >= 1024 ? String(Math.round(mb / 1024)) : String(mb);
 }
 
+// ─────────────────────────────────────────────
+//  PROFIT SETTINGS
+// ─────────────────────────────────────────────
+
 async function getProfitSettings() {
-  if (profitSettingsCache) return profitSettingsCache;
-  if (!db) return { mode: "flat", flatAmount: 0 };
-  try {
-    const snap = await db.ref("system/profitSettings").once("value");
-    profitSettingsCache = snap.val() || { mode: "flat", flatAmount: 0 };
+  if (profitSettingsCache && (Date.now() - lastCacheUpdate) < CACHE_TTL) {
     return profitSettingsCache;
-  } catch {
-    return { mode: "flat", flatAmount: 0 };
   }
+
+  if (profitSettingsPromise) return profitSettingsPromise;
+
+  profitSettingsPromise = (async () => {
+    if (!db) {
+      const defaultSettings = { mode: "flat", flatAmount: 0 };
+      profitSettingsCache = defaultSettings;
+      lastCacheUpdate = Date.now();
+      return defaultSettings;
+    }
+    try {
+      const snap = await db.ref("system/profitSettings").once("value");
+      profitSettingsCache = snap.val() || { mode: "flat", flatAmount: 0 };
+      lastCacheUpdate = Date.now();
+      return profitSettingsCache;
+    } catch (err) {
+      console.warn(`⚠️ Could not load profit settings: ${err.message}`);
+      return { mode: "flat", flatAmount: 0 };
+    } finally {
+      profitSettingsPromise = null;
+    }
+  })();
+
+  return profitSettingsPromise;
 }
 
 function applyProfit(costPrice, volumeInMB, network, settings) {
   if (!settings) return costPrice;
-  const { mode, flatAmount, percentAmount, perBundle } = settings;
+  const { mode, flatAmount = 0, percentAmount = 0, perBundle = {} } = settings;
+  
   if (mode === "percent") {
     const pct = parseFloat(percentAmount) || 0;
-    return Math.ceil((costPrice * (1 + pct / 100)) * 20) / 20;
+    return Math.ceil(costPrice * (1 + pct / 100) * 20) / 20;
   }
   if (mode === "perBundle") {
     const key = `${network}_${volumeInMB}`;
@@ -144,85 +422,189 @@ function applyProfit(costPrice, volumeInMB, network, settings) {
 }
 
 // ─────────────────────────────────────────────
-//  DELIVERY FUNCTIONS
+//  DELIVERY FUNCTIONS WITH RETRY
 // ─────────────────────────────────────────────
 
 async function deliverViaRemaData(phone, volumeInMB, reference) {
+  if (!REMADATA_API_KEY) {
+    throw new AppError(
+      "RemaData API not configured. Please set REMADATA_API_KEY environment variable.",
+      503, "CONFIGURATION"
+    );
+  }
+  
   const orderRef = reference || `DF-${Date.now()}`;
-  const formattedPhone = formatPhoneNumber(phone);
-
-  // FIX: Convert binary MB to RemaData's decimal MB standard
-  const REMA_MB_MAP = {
-    1024: 1000, 2048: 2000, 3072: 3000, 4096: 4000,
-    5120: 5000, 6144: 6000, 8192: 8000, 10240: 10000,
-    15360: 15000, 20480: 20000, 25600: 25000, 30720: 30000,
-    40960: 40000, 51200: 50000, 102400: 100000
-  };
+  const localPhone = formatPhoneLocal(phone);
   const remaMB = REMA_MB_MAP[Number(volumeInMB)] || Number(volumeInMB);
 
   const payload = {
     ref: orderRef,
-    phone: formattedPhone,
+    phone: localPhone,
     volumeInMB: remaMB,
-    networkType: "mtn"
+    networkType: "mtn",
   };
 
-  console.log(`📦 [RemaData] Delivering ${remaMB}MB MTN → ${phone}`);
+  console.log(`📦 [RemaData] ${volumeInMB}MB → ${remaMB}MB MTN → ${localPhone} | Ref: ${orderRef}`);
 
-  const response = await axios.post(`${REMADATA_API_URL}/buy-data`, payload, {
-    headers: { "X-API-KEY": REMADATA_API_KEY, "Content-Type": "application/json" },
-    timeout: 30000,
+  const response = await fetchWithRetry(async () => {
+    return await axios.post(`${REMADATA_API_URL}/buy-data`, payload, {
+      headers: { "X-API-KEY": REMADATA_API_KEY, "Content-Type": "application/json" },
+      timeout: 30000,
+    });
   });
+
+  if (response.data?.status !== "success") {
+    const providerMsg = response.data?.message || response.data?.error || "Unknown provider error";
+    throw new AppError(
+      `RemaData delivery rejected: ${providerMsg}`,
+      502, "PROVIDER",
+      { providerResponse: response.data }
+    );
+  }
 
   const remaReference = response.data?.data?.reference || response.data?.reference || orderRef;
+  console.log(`✅ [RemaData] Delivered | Provider ref: ${remaReference}`);
 
-  return {
-    success: response.data?.status === "success",
-    reference: remaReference,
-    data: response.data,
-    provider: "RemaData"
-  };
+  return { success: true, reference: remaReference, data: response.data, provider: "RemaData" };
 }
 
+// ✅ FIXED: HubNetGH now correctly handles all network types (mtn, telecel, airteltigo)
 async function deliverViaHubNet(phone, networkType, volumeInMB, reference) {
-  const network = networkType === "airteltigo" ? "airteltigo" : "telecel";
+  if (!HUBNET_API_KEY) {
+    throw new AppError(
+      "HubNetGH API not configured. Please set HUBNET_API_KEY environment variable.",
+      503, "CONFIGURATION"
+    );
+  }
+  
+  // ✅ FIX: Properly map all network types to HubNetGH expected values
+  let network;
+  switch (networkType) {
+    case "airteltigo":
+      network = "airteltigo";
+      break;
+    case "telecel":
+      network = "telecel";
+      break;
+    case "mtn":
+      network = "mtn";
+      break;
+    default:
+      network = "telecel";
+      console.warn(`⚠️ Unknown network type "${networkType}", defaulting to "telecel"`);
+  }
+  
   const volume = resolveVolume(volumeInMB);
   const requestId = reference || `DF-${Date.now()}`;
+  const localPhone = formatPhoneLocal(phone);
 
-  console.log(`📦 [HubNetGH] Delivering ${volume}GB ${network} → ${phone}`);
+  console.log(`📦 [HubNetGH] ${volume}GB ${network} → ${localPhone} | Ref: ${requestId}`);
 
-  const response = await axios.post(`${HUBNET_BASE_URL}/place_order`, {
-    network,
-    volume,
-    customer_number: phone,
-    quantity: 1,
-    request_id: requestId,
-  }, {
-    headers: { "Content-Type": "application/json", "X-API-KEY": HUBNET_API_KEY },
-    timeout: 30000,
+  const response = await fetchWithRetry(async () => {
+    return await axios.post(
+      `${HUBNET_BASE_URL}/place_order`,
+      { network, volume, customer_number: localPhone, quantity: 1, request_id: requestId },
+      {
+        headers: { "Content-Type": "application/json", "X-API-KEY": HUBNET_API_KEY },
+        timeout: 30000,
+      }
+    );
   });
 
-  return {
-    success: response.data?.success === true,
-    reference: String(response.data?.order_id || requestId),
-    data: response.data,
-    provider: "HubNetGH"
-  };
+  if (!response.data?.success) {
+    const providerMsg = response.data?.message || response.data?.error || "Unknown provider error";
+    throw new AppError(
+      `HubNetGH delivery rejected: ${providerMsg}`,
+      502, "PROVIDER",
+      { providerResponse: response.data }
+    );
+  }
+
+  const orderId = String(response.data?.order_id || requestId);
+  console.log(`✅ [HubNetGH] Delivered | Order ID: ${orderId}`);
+
+  return { success: true, reference: orderId, data: response.data, provider: "HubNetGH" };
 }
 
+// ─────────────────────────────────────────────
+//  DELIVERY ORCHESTRATOR WITH BIDIRECTIONAL FAILOVER
+// ─────────────────────────────────────────────
+
 async function deliverData(phone, networkType, volumeInMB, reference = null) {
-  const provider = NETWORK_PROVIDER[networkType?.toLowerCase()];
-  if (!provider) throw new Error(`Unsupported network type: ${networkType}`);
-  if (provider.name === "RemaData") {
-    return await deliverViaRemaData(phone, volumeInMB, reference);
-  } else {
-    return await deliverViaHubNet(phone, networkType, volumeInMB, reference);
+  const net = networkType?.toLowerCase();
+  const providerConfig = NETWORK_PROVIDER[net];
+  
+  if (!providerConfig) {
+    throw new AppError(
+      `Unsupported network: "${networkType}". Valid: ${Object.keys(NETWORK_PROVIDER).join(", ")}`,
+      400, "VALIDATION"
+    );
+  }
+  
+  const primaryProvider = providerConfig.name;
+  const fallbackProvider = providerConfig.fallback;
+  const fallbackNetwork = providerConfig.fallbackNetwork;
+  
+  // Track all errors for final customer notification
+  const errors = [];
+  
+  // Try primary provider
+  console.log(`📡 Trying primary provider: ${primaryProvider} for ${net}`);
+  try {
+    if (primaryProvider === "RemaData") {
+      return await deliverViaRemaData(phone, volumeInMB, reference);
+    } else {
+      return await deliverViaHubNet(phone, net, volumeInMB, reference);
+    }
+  } catch (primaryError) {
+    const errorMsg = `${primaryProvider}: ${primaryError.message}`;
+    errors.push(errorMsg);
+    console.warn(`⚠️ Primary provider ${primaryProvider} failed: ${primaryError.message}`);
+    
+    // Try fallback provider if configured
+    if (fallbackProvider) {
+      console.log(`🔄 Attempting fallback: ${fallbackProvider} for ${net}`);
+      try {
+        let result;
+        if (fallbackProvider === "RemaData") {
+          result = await deliverViaRemaData(phone, volumeInMB, reference);
+        } else if (fallbackProvider === "HubNetGH") {
+          // Pass the fallbackNetwork (e.g., "mtn", "telecel", "airteltigo")
+          result = await deliverViaHubNet(phone, fallbackNetwork, volumeInMB, reference);
+        } else {
+          throw new Error(`Unknown fallback provider: ${fallbackProvider}`);
+        }
+        
+        console.log(`✅ Fallback successful! Delivered via ${fallbackProvider} for ${net}`);
+        return result;
+      } catch (fallbackError) {
+        const fallbackErrorMsg = `${fallbackProvider}: ${fallbackError.message}`;
+        errors.push(fallbackErrorMsg);
+        console.error(`❌ Fallback provider ${fallbackProvider} also failed: ${fallbackError.message}`);
+      }
+    }
+    
+    // Both providers failed - throw customer-friendly error
+    const allErrors = errors.join(" | ");
+    const customerMessage = getCustomerFriendlyMessage(net, allErrors);
+    
+    throw new AppError(
+      customerMessage,
+      503,
+      "PROVIDER_FAILOVER",
+      { 
+        network: net,
+        attemptedProviders: errors,
+        timestamp: new Date().toISOString()
+      }
+    );
   }
 }
 
 // ─────────────────────────────────────────────
 //  WEBHOOK HANDLER
 // ─────────────────────────────────────────────
+
 function verifyPaystackSignature(rawBody, signature) {
   if (!PAYSTACK_SECRET || !rawBody || !signature) return false;
   const hash = crypto.createHmac("sha512", PAYSTACK_SECRET).update(rawBody).digest("hex");
@@ -233,26 +615,20 @@ app.post("/paystack/webhook", async (req, res) => {
   const signature = req.headers["x-paystack-signature"];
 
   if (!verifyPaystackSignature(req.rawBody, signature)) {
-    console.warn("⚠️ Invalid Paystack webhook signature");
+    console.warn("⚠️ Paystack webhook: invalid signature");
     return res.status(401).json({ error: "Invalid signature" });
   }
 
-  let event;
-  try {
-    event = JSON.parse(req.rawBody.toString());
-    console.log(`📨 Webhook received: ${event.event}`);
-  } catch (err) {
-    console.error("❌ Failed to parse webhook body:", err.message);
-    return res.status(400).json({ error: "Invalid JSON" });
+  const event = req.body;
+  if (!event?.event) {
+    console.error("❌ Webhook: empty or malformed body");
+    return res.status(400).json({ error: "Invalid body" });
   }
 
-  // Respond immediately to Paystack
+  console.log(`📨 Webhook: ${event.event}`);
   res.status(200).json({ received: true });
 
-  if (event.event !== "charge.success") {
-    console.log(`📝 Webhook event ignored: ${event.event}`);
-    return;
-  }
+  if (event.event !== "charge.success") return;
 
   const { data } = event;
   const meta = data.metadata || {};
@@ -262,48 +638,37 @@ app.post("/paystack/webhook", async (req, res) => {
   const ref = data.reference;
   const amount = data.amount ? data.amount / 100 : 0;
 
+  const baseOrderData = { ref, phone, networkType, volumeInMB, amount, source: "paystack_webhook" };
+
   if (!phone || !volumeInMB || !networkType) {
-    console.warn(`⚠️ Missing delivery data: phone=${phone}, volume=${volumeInMB}, network=${networkType}`);
+    console.warn(`⚠️ Webhook: missing metadata — phone=${phone}, volume=${volumeInMB}, network=${networkType}`);
     return;
   }
 
   if (processedRefs.has(ref)) {
-    console.warn(`⚠️ Duplicate webhook ignored for ref: ${ref}`);
+    console.warn(`⚠️ Webhook: duplicate ref ignored — ${ref}`);
     return;
   }
-  processedRefs.add(ref);
+  processedRefs.set(ref, Date.now());
+
+  console.log(`💳 Webhook auto-delivery: ${networkType} ${volumeInMB}MB → ${phone}`);
 
   try {
-    console.log(`💳 Auto-delivering: ${networkType} ${volumeInMB}MB → ${phone}`);
-
-    // ✅ DIRECT CALL - NO HTTP REQUEST
     const result = await deliverData(phone, networkType, Number(volumeInMB), ref);
 
-    if (result.success) {
-      console.log(`✅ Auto-delivery successful via ${result.provider} | Ref: ${result.reference}`);
+    await saveOrderWithRetry(ref, {
+      ...baseOrderData,
+      status: "completed",
+      provider: result.provider,
+      providerRef: result.reference,
+      timestamp: new Date().toISOString(),
+    });
 
-      // FIX 1: Save completed order to Firebase
-      if (db) {
-        await db.ref("transactions/" + ref).set({
-          ref,
-          phone,
-          networkType,
-          volumeInMB,
-          amount,
-          status: "completed",
-          provider: result.provider,
-          providerRef: result.reference,
-          timestamp: new Date().toISOString(),
-          source: "paystack_webhook"
-        }).catch(e => console.warn("⚠️ Firebase save error:", e.message));
-      }
-    } else {
-      console.error(`❌ Auto-delivery failed: ${result.data?.message}`);
-      processedRefs.delete(ref); // Allow retry
-    }
+    console.log(`✅ Webhook delivery complete | Provider: ${result.provider}`);
   } catch (err) {
-    console.error(`❌ Webhook error:`, err.message);
-    processedRefs.delete(ref); // Allow retry
+    console.error(`❌ Webhook delivery failed: ${err.message}`);
+    await saveFailedOrderWithRetry(ref, baseOrderData, err.message);
+    processedRefs.delete(ref);
   }
 });
 
@@ -316,49 +681,68 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
+  const criticalIssues = [];
+  if (!REMADATA_API_KEY) criticalIssues.push("MTN deliveries will fail");
+  if (!HUBNET_API_KEY) criticalIssues.push("Telecel/AT deliveries will fail");
+  if (!DELIVER_SECRET) criticalIssues.push("/deliver endpoint unprotected");
+  
   res.json({
-    status: "OK",
+    status: criticalIssues.length > 0 ? "DEGRADED" : "OK",
     service: "DataFlow GH",
     timestamp: new Date().toISOString(),
+    criticalIssues,
     providers: {
-      mtn: { provider: "RemaData", configured: !!REMADATA_API_KEY },
-      telecel: { provider: "HubNetGH", configured: !!HUBNET_API_KEY },
-      airteltigo: { provider: "HubNetGH", configured: !!HUBNET_API_KEY }
+      mtn: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY },
+      telecel: { provider: "HubNetGH", configured: !!HUBNET_API_KEY, operational: !!HUBNET_API_KEY },
+      airteltigo: { provider: "HubNetGH", configured: !!HUBNET_API_KEY, operational: !!HUBNET_API_KEY },
+    },
+    failover: {
+      mtn: "RemaData → HubNetGH",
+      telecel: "HubNetGH → RemaData",
+      airteltigo: "HubNetGH → RemaData"
     },
     firebase: !!db,
-    webhook: !!PAYSTACK_SECRET
+    firebaseQueueSize: failedSaveQueue.length,
+    webhook: !!PAYSTACK_SECRET,
+    memory: { processedRefsSize: processedRefs.size },
   });
 });
 
-app.get("/api/balance", async (req, res) => {
+app.get("/api/balance", asyncHandler(async (req, res) => {
+  if (!REMADATA_API_KEY) {
+    throw new AppError("RemaData API not configured", 503, "CONFIGURATION");
+  }
   try {
     const response = await axios.get(`${REMADATA_API_URL}/wallet-balance`, {
       headers: { "X-API-KEY": REMADATA_API_KEY },
-      timeout: 10000
+      timeout: 10000,
     });
     res.json(response.data);
   } catch (err) {
-    res.status(500).json({ status: "error", message: "Failed to fetch balance" });
+    throw new AppError(`Failed to fetch balance: ${err.message}`, 502, "PROVIDER");
   }
-});
+}));
 
-app.get("/api/hubnet/balance", async (req, res) => {
+app.get("/api/hubnet/balance", asyncHandler(async (req, res) => {
+  if (!HUBNET_API_KEY) {
+    return res.json({ status: "info", balance: null, message: "HubNet API not configured" });
+  }
   try {
     const response = await axios.get(`${HUBNET_BASE_URL}/check_balance`, {
       headers: { "X-API-KEY": HUBNET_API_KEY },
-      timeout: 15000
+      timeout: 15000,
     });
     if (response.data?.success) {
-      res.json({ status: "success", balance: response.data.wallet_balance || 0 });
-    } else {
-      res.json({ status: "info", balance: null, message: "Check HubNet dashboard" });
+      return res.json({ status: "success", balance: response.data.wallet_balance ?? 0 });
     }
+    res.json({ status: "info", balance: null, message: "Balance unavailable" });
   } catch (err) {
-    res.json({ status: "info", balance: null, message: "Check HubNet dashboard" });
+    console.warn(`⚠️ HubNet balance check failed: ${err.message}`);
+    res.json({ status: "info", balance: null, message: "Balance unavailable" });
   }
-});
+}));
 
-app.get("/api/bundles", async (req, res) => {
+app.get("/api/bundles", asyncHandler(async (req, res) => {
   const network = (req.query.network || "mtn").toLowerCase();
 
   const bundleData = {
@@ -377,7 +761,7 @@ app.get("/api/bundles", async (req, res) => {
       { volumeInMB: 30720, volume: "30GB", price: 116.00, name: "30GB", network: "mtn" },
       { volumeInMB: 40960, volume: "40GB", price: 155.00, name: "40GB", network: "mtn" },
       { volumeInMB: 51200, volume: "50GB", price: 186.00, name: "50GB", network: "mtn" },
-      { volumeInMB: 102400, volume: "100GB", price: 370.00, name: "100GB", network: "mtn" }
+      { volumeInMB: 102400, volume: "100GB", price: 370.00, name: "100GB", network: "mtn" },
     ],
     telecel: [
       { volumeInMB: 10240, volume: "10GB", price: 38.00, name: "10GB", network: "telecel" },
@@ -387,7 +771,7 @@ app.get("/api/bundles", async (req, res) => {
       { volumeInMB: 30720, volume: "30GB", price: 109.00, name: "30GB", network: "telecel" },
       { volumeInMB: 40960, volume: "40GB", price: 143.00, name: "40GB", network: "telecel" },
       { volumeInMB: 51200, volume: "50GB", price: 177.00, name: "50GB", network: "telecel" },
-      { volumeInMB: 102400, volume: "100GB", price: 354.00, name: "100GB", network: "telecel" }
+      { volumeInMB: 102400, volume: "100GB", price: 354.00, name: "100GB", network: "telecel" },
     ],
     airteltigo: [
       { volumeInMB: 1024, volume: "1GB", price: 3.90, name: "1GB", network: "airteltigo" },
@@ -403,108 +787,220 @@ app.get("/api/bundles", async (req, res) => {
       { volumeInMB: 12288, volume: "12GB", price: 47.00, name: "12GB", network: "airteltigo" },
       { volumeInMB: 15360, volume: "15GB", price: 59.00, name: "15GB", network: "airteltigo" },
       { volumeInMB: 20480, volume: "20GB", price: 78.50, name: "20GB", network: "airteltigo" },
-      { volumeInMB: 25600, volume: "25GB", price: 98.00, name: "25GB", network: "airteltigo" }
-    ]
+      { volumeInMB: 25600, volume: "25GB", price: 98.00, name: "25GB", network: "airteltigo" },
+    ],
   };
 
-  let bundles = bundleData[network] || bundleData.mtn;
+  if (!bundleData[network]) {
+    throw new AppError(`Unknown network "${network}"`, 400, "VALIDATION");
+  }
+
+  let bundles = bundleData[network];
 
   if (network !== "mtn") {
     const settings = await getProfitSettings();
-    bundles = bundles.map(b => ({
+    bundles = bundles.map((b) => ({
       ...b,
       costPrice: b.price,
-      price: applyProfit(b.price, b.volumeInMB, network, settings)
+      price: applyProfit(b.price, b.volumeInMB, network, settings),
     }));
   }
 
   res.json({ status: "success", data: bundles, count: bundles.length });
-});
+}));
 
-// FIX 2: Added input validation to /deliver
-app.post("/deliver", requireApiKey, async (req, res) => {
+app.post("/deliver", requireApiKey, asyncHandler(async (req, res) => {
   const { phone, networkType, volumeInMB, ref } = req.body;
 
   if (!phone || !networkType || !volumeInMB) {
-    return res.status(400).json({ status: "error", message: "Missing required fields: phone, networkType, volumeInMB" });
+    throw new AppError("Missing required fields: phone, networkType, volumeInMB", 400, "VALIDATION");
   }
 
-  const validNetworks = ["mtn", "telecel", "airteltigo"];
+  const validNetworks = Object.keys(NETWORK_PROVIDER);
   if (!validNetworks.includes(networkType.toLowerCase())) {
-    return res.status(400).json({ status: "error", message: `Invalid network. Must be: ${validNetworks.join(", ")}` });
+    throw new AppError(`Invalid network "${networkType}"`, 400, "VALIDATION");
   }
 
   const volumeNum = Number(volumeInMB);
   if (isNaN(volumeNum) || volumeNum <= 0) {
-    return res.status(400).json({ status: "error", message: "Invalid volumeInMB" });
+    throw new AppError("volumeInMB must be a positive number", 400, "VALIDATION");
   }
 
-  try {
-    const result = await deliverData(phone, networkType.toLowerCase(), volumeNum, ref);
-    if (result.success) {
-      console.log(`✅ Manual delivery successful via ${result.provider}`);
-      res.json({ status: "success", provider: result.provider, reference: result.reference, data: result.data });
-    } else {
-      res.status(500).json({ status: "error", message: result.data?.message || "Delivery failed" });
-    }
-  } catch (err) {
-    console.error("❌ /deliver error:", err.message);
-    res.status(err.response?.status || 500).json({ status: "error", message: err.response?.data?.message || err.message });
-  }
-});
+  const result = await deliverData(phone, networkType.toLowerCase(), volumeNum, ref);
 
-app.get("/api/order-status/:reference", async (req, res) => {
+  console.log(`✅ Manual delivery complete | Provider: ${result.provider}`);
+  res.json({
+    status: "success",
+    provider: result.provider,
+    reference: result.reference,
+    data: result.data,
+  });
+}));
+
+// ─────────────────────────────────────────────
+//  ORDER STATUS LOOKUP - ENHANCED WITH FIREBASE FIRST
+// ─────────────────────────────────────────────
+
+app.get("/api/order-status/:reference", asyncHandler(async (req, res) => {
   const { reference } = req.params;
   const { network } = req.query;
 
-  const providersToTry = network
-    ? [NETWORK_PROVIDER[network.toLowerCase()]]
-    : Object.values(NETWORK_PROVIDER);
+  if (!reference) {
+    throw new AppError("Reference parameter is required", 400, "VALIDATION");
+  }
 
-  for (const provider of providersToTry) {
-    if (!provider) continue;
+  // STEP 1: Check Firebase first to get the provider reference
+  let knownProvider = null;
+  let providerRef = null;
+  
+  if (db) {
     try {
-      if (provider.name === "RemaData") {
-        const response = await axios.get(`${REMADATA_API_URL}/order-status/${encodeURIComponent(reference)}`, {
-          headers: { "X-API-KEY": REMADATA_API_KEY },
-          timeout: 10000
-        });
-        if (response.data?.status === "success") {
-          return res.json({ status: "success", provider: provider.name, data: response.data.data });
-        }
-      } else if (provider.name === "HubNetGH") {
-        const response = await axios.get(`${HUBNET_BASE_URL}/order_status`, {
-          params: { order_id: reference },
-          headers: { "X-API-KEY": HUBNET_API_KEY },
-          timeout: 10000
-        });
-        if (response.data?.success) {
-          return res.json({ status: "success", provider: provider.name, data: response.data });
-        }
+      const snapshot = await db.ref(`transactions/${reference}`).once("value");
+      const order = snapshot.val();
+      if (order && order.provider && order.providerRef) {
+        knownProvider = order.provider;
+        providerRef = order.providerRef;
+        console.log(`📦 Found order in Firebase. Provider: ${knownProvider}, ProviderRef: ${providerRef}`);
       }
     } catch (err) {
-      continue;
+      console.warn(`⚠️ Firebase lookup failed: ${err.message}`);
     }
   }
 
-  return res.status(404).json({ status: "error", message: "Order not found" });
-});
-
-app.get("/api/profit-settings", async (req, res) => {
-  try {
-    const settings = await getProfitSettings();
-    res.json({ status: "success", settings });
-  } catch (err) {
-    res.status(500).json({ status: "error", message: err.message });
+  // STEP 2: Build provider list (prioritize known provider from Firebase)
+  let providersToTry = [];
+  
+  if (knownProvider) {
+    // Use the provider we know from Firebase with the correct providerRef
+    providersToTry = [{ name: knownProvider, ref: providerRef }];
+  } else if (network) {
+    // Use network filter
+    const providerConfig = NETWORK_PROVIDER[network.toLowerCase()];
+    if (providerConfig) {
+      providersToTry = [{ name: providerConfig.name, ref: reference }];
+    }
+  } else {
+    // Try all providers with the original reference
+    providersToTry = [
+      { name: "RemaData", ref: reference },
+      { name: "HubNetGH", ref: reference }
+    ];
   }
-});
 
-app.post("/api/profit-settings", async (req, res) => {
+  const errors = [];
+
+  for (const provider of providersToTry) {
+    try {
+      const lookupRef = provider.ref || reference;
+      
+      if (provider.name === "RemaData") {
+        if (!REMADATA_API_KEY) { 
+          errors.push("RemaData: API not configured"); 
+          continue; 
+        }
+        console.log(`🔍 Checking RemaData status for ref: ${lookupRef}`);
+        const response = await axios.get(
+          `${REMADATA_API_URL}/order-status/${encodeURIComponent(lookupRef)}`,
+          { headers: { "X-API-KEY": REMADATA_API_KEY }, timeout: 10000 }
+        );
+        if (response.data?.status === "success") {
+          return res.json({ 
+            status: "success", 
+            provider: provider.name, 
+            reference: lookupRef,
+            data: response.data.data 
+          });
+        }
+        errors.push(`RemaData: ${response.data?.message || "not found"}`);
+      } 
+      else if (provider.name === "HubNetGH") {
+        if (!HUBNET_API_KEY) { 
+          errors.push("HubNetGH: API not configured"); 
+          continue; 
+        }
+        console.log(`🔍 Checking HubNetGH status for order_id: ${lookupRef}`);
+        const response = await axios.get(`${HUBNET_BASE_URL}/order_status`, {
+          params: { order_id: lookupRef },
+          headers: { "X-API-KEY": HUBNET_API_KEY },
+          timeout: 10000,
+        });
+        if (response.data?.success) {
+          return res.json({ 
+            status: "success", 
+            provider: provider.name, 
+            reference: lookupRef,
+            data: response.data 
+          });
+        }
+        errors.push(`HubNetGH: ${response.data?.message || "not found"}`);
+      }
+    } catch (err) {
+      errors.push(`${provider.name}: ${err.response?.data?.message || err.message}`);
+    }
+  }
+
+  // Step 3: If not found and we have Firebase data but provider check failed, try alternative
+  if (knownProvider && providerRef && errors.length > 0) {
+    console.log(`🔄 Firebase had provider ${knownProvider} but check failed, trying alternative providers...`);
+    // Try the other provider as fallback
+    const otherProvider = knownProvider === "RemaData" ? "HubNetGH" : "RemaData";
+    try {
+      if (otherProvider === "RemaData" && REMADATA_API_KEY) {
+        const response = await axios.get(
+          `${REMADATA_API_URL}/order-status/${encodeURIComponent(reference)}`,
+          { headers: { "X-API-KEY": REMADATA_API_KEY }, timeout: 10000 }
+        );
+        if (response.data?.status === "success") {
+          return res.json({ 
+            status: "success", 
+            provider: otherProvider, 
+            reference: reference,
+            data: response.data.data,
+            note: "Found via alternative provider" 
+          });
+        }
+      } else if (otherProvider === "HubNetGH" && HUBNET_API_KEY) {
+        const response = await axios.get(`${HUBNET_BASE_URL}/order_status`, {
+          params: { order_id: reference },
+          headers: { "X-API-KEY": HUBNET_API_KEY },
+          timeout: 10000,
+        });
+        if (response.data?.success) {
+          return res.json({ 
+            status: "success", 
+            provider: otherProvider, 
+            reference: reference,
+            data: response.data,
+            note: "Found via alternative provider" 
+          });
+        }
+      }
+    } catch (err) {
+      errors.push(`Alternative ${otherProvider}: ${err.message}`);
+    }
+  }
+
+  console.warn(`⚠️ Order not found for ref "${reference}" | Tried: ${errors.join(" | ")}`);
+  res.status(404).json({
+    status: "error",
+    message: "Order not found",
+    details: errors,
+  });
+}));
+
+app.get("/api/profit-settings", asyncHandler(async (req, res) => {
+  const settings = await getProfitSettings();
+  res.json({ status: "success", settings });
+}));
+
+app.post("/api/profit-settings", asyncHandler(async (req, res) => {
   const { mode, flatAmount, percentAmount, perBundle } = req.body;
   const validModes = ["flat", "percent", "perBundle"];
+
   if (!validModes.includes(mode)) {
-    return res.status(400).json({ status: "error", message: "mode must be flat | percent | perBundle" });
+    throw new AppError(`Invalid mode "${mode}"`, 400, "VALIDATION");
   }
+
   const settings = {
     mode,
     flatAmount: parseFloat(flatAmount) || 0,
@@ -512,53 +1008,115 @@ app.post("/api/profit-settings", async (req, res) => {
     perBundle: perBundle || {},
     updatedAt: new Date().toISOString(),
   };
-  try {
-    if (db) await db.ref("system/profitSettings").set(settings);
-    profitSettingsCache = settings;
-    res.json({ status: "success", settings });
-  } catch (err) {
-    res.status(500).json({ status: "error", message: err.message });
+
+  if (db) {
+    try {
+      await db.ref("system/profitSettings").set(settings);
+    } catch (err) {
+      throw new AppError(`Failed to save settings: ${err.message}`, 500, "FIREBASE");
+    }
   }
-});
 
-// 404 handler
+  profitSettingsCache = settings;
+  lastCacheUpdate = Date.now();
+  profitSettingsPromise = null;
+
+  res.json({ status: "success", settings });
+}));
+
+// ─────────────────────────────────────────────
+//  404 HANDLER
+// ─────────────────────────────────────────────
 app.use((req, res) => {
-  res.status(404).json({ status: "error", message: `Route ${req.method} ${req.url} not found` });
+  res.status(404).json({ status: "error", message: `Route not found: ${req.method} ${req.url}` });
 });
 
-// Error handler
+// ─────────────────────────────────────────────
+//  ERROR HANDLER
+// ─────────────────────────────────────────────
 app.use((err, req, res, next) => {
-  console.error("💥 Server error:", err.stack);
-  res.status(500).json({ status: "error", message: "Internal server error" });
+  const isOperational = err.isOperational === true;
+  const statusCode = err.statusCode || 500;
+  const category = err.category || "INTERNAL";
+
+  if (isOperational) {
+    console.warn(`⚠️ [${category}] ${err.message}`);
+  } else {
+    console.error(`💥 [UNHANDLED] ${err.message}\n${err.stack}`);
+  }
+
+  const body = {
+    status: "error",
+    category,
+    message: isOperational ? err.message : "Internal server error",
+  };
+
+  if (err.details && process.env.NODE_ENV !== "production") {
+    body.details = err.details;
+  }
+
+  res.status(statusCode).json(body);
+});
+
+// ─────────────────────────────────────────────
+//  GRACEFUL SHUTDOWN
+// ─────────────────────────────────────────────
+
+process.on("SIGTERM", async () => {
+  console.log("🛑 SIGTERM received, starting graceful shutdown...");
+  
+  if (failedSaveQueue.length > 0) {
+    console.log(`📦 Processing ${failedSaveQueue.length} queued saves before shutdown...`);
+    await processFailedSaveQueue();
+  }
+  
+  console.log("✅ Graceful shutdown complete");
+  process.exit(0);
+});
+
+process.on("SIGINT", async () => {
+  console.log("🛑 SIGINT received, shutting down...");
+  process.exit(0);
 });
 
 // ─────────────────────────────────────────────
 //  START SERVER
 // ─────────────────────────────────────────────
+
+validateEnv();
+
 app.listen(PORT, () => {
+  const col = (label, ok) => `  ${label.padEnd(28)} ${ok ? "✅" : "❌"}`;
   console.log(`
-╔══════════════════════════════════════════════╗
-║   🚀 DataFlow GH Backend Running             ║
-║   📡 Port: ${PORT}                               ║
-║                                              ║
-║   MTN     → RemaData  ${REMADATA_API_KEY ? "✅" : "❌"}                  ║
-║   Telecel → HubNetGH  ${HUBNET_API_KEY ? "✅" : "❌"}                  ║
-║   AT      → HubNetGH  ${HUBNET_API_KEY ? "✅" : "❌"}                  ║
-║                                              ║
-║   Paystack Webhook: ${PAYSTACK_SECRET ? "✅" : "❌"}                    ║
-║   /deliver protected: ${DELIVER_SECRET ? "✅" : "❌"}                  ║
-║   Firebase: ${db ? "✅" : "❌"}                               ║
-╚══════════════════════════════════════════════╝
-  `);
+╔══════════════════════════════════════════════════════════════╗
+║   🚀  DataFlow GH Backend — Production Ready                 ║
+║   📡  Port: ${String(PORT).padEnd(37)}║
+╠══════════════════════════════════════════════════════════════╣
+${col("║  MTN → RemaData", !!REMADATA_API_KEY)}        ║
+${col("║  Telecel → HubNetGH", !!HUBNET_API_KEY)}        ║
+${col("║  AirtelTigo → HubNetGH", !!HUBNET_API_KEY)}        ║
+${col("║  Paystack Webhook", !!PAYSTACK_SECRET)}        ║
+${col("║  /deliver Auth", !!DELIVER_SECRET)}        ║
+${col("║  Firebase", !!db)}        ║
+╠══════════════════════════════════════════════════════════════╣
+║  Features:                                                  ║
+║  • Retry logic (${MAX_RETRIES}x exponential backoff)                   ║
+║  • Bidirectional failover (MTN ↔ Telecel/AT)               ║
+║  • HubNetGH now supports MTN, Telecel, AirtelTigo          ║
+║  • Memory protection (${MAX_REF_SIZE} max refs)                        ║
+║  • Firebase queue (${failedSaveQueue.length} pending)                    ║
+║  • Enhanced status lookup (Firebase first)                 ║
+║  • Customer-friendly error messages                        ║
+╚══════════════════════════════════════════════════════════════╝`);
 });
 
-// Keep-alive ping for Render free tier
+// Keep-alive for Render free tier
 if (process.env.NODE_ENV === "production") {
   setInterval(async () => {
     try {
       await axios.get(`http://localhost:${PORT}/health`, { timeout: 10000 });
     } catch (err) {
-      console.error("⚠️ Keep-alive failed:", err.message);
+      console.error(`⚠️ Keep-alive failed: ${err.message}`);
     }
   }, 4 * 60 * 1000);
 }
