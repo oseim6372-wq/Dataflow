@@ -346,6 +346,207 @@ function requireApiKey(req, res, next) {
 }
 
 // ─────────────────────────────────────────────
+//  PARTNER AUTH MIDDLEWARE (NEW)
+// ─────────────────────────────────────────────
+
+async function validatePartner(req, res, next) {
+  const apiKey = req.headers["x-api-key"];
+  const partnerId = req.headers["x-partner-id"];
+  
+  if (!apiKey || !partnerId) {
+    return res.status(401).json({
+      status: "error",
+      message: "Missing API key or Partner ID",
+      code: "MISSING_CREDENTIALS"
+    });
+  }
+  
+  if (!db) {
+    return res.status(503).json({
+      status: "error",
+      message: "Database unavailable",
+      code: "DB_ERROR"
+    });
+  }
+  
+  try {
+    const snapshot = await db.ref(`developers`).orderByChild('apiKey').equalTo(apiKey).once('value');
+    const developers = snapshot.val();
+    
+    let partner = null;
+    for (const key in developers) {
+      if (developers[key].partnerId === partnerId) {
+        partner = developers[key];
+        partner.uid = key;
+        break;
+      }
+    }
+    
+    if (!partner) {
+      return res.status(401).json({
+        status: "error",
+        message: "Invalid API key or Partner ID",
+        code: "INVALID_CREDENTIALS"
+      });
+    }
+    
+    // Update total requests
+    await db.ref(`developers/${partner.uid}`).update({
+      totalRequests: (partner.totalRequests || 0) + 1,
+      lastUsed: new Date().toISOString()
+    });
+    
+    req.partner = partner;
+    next();
+  } catch (err) {
+    console.error("Partner validation error:", err);
+    res.status(500).json({
+      status: "error",
+      message: "Authentication failed",
+      code: "AUTH_ERROR"
+    });
+  }
+}
+
+// ─────────────────────────────────────────────
+//  WALLET FUNCTIONS (NEW)
+// ─────────────────────────────────────────────
+
+async function getPartnerWallet(partnerId) {
+  if (!db) return { balance: 0, transactions: [] };
+  try {
+    const walletId = `partner_${partnerId}`;
+    const snapshot = await db.ref(`wallets/${walletId}`).once("value");
+    const data = snapshot.val();
+    return {
+      balance: data?.balance || 0,
+      transactions: data?.transactions || [],
+      partnerId: partnerId
+    };
+  } catch (err) {
+    console.error(`Failed to get wallet for ${partnerId}:`, err);
+    return { balance: 0, transactions: [], partnerId: partnerId };
+  }
+}
+
+async function creditPartnerWallet(partnerId, amount, reference, description) {
+  if (!db) throw new AppError("Wallet system unavailable", 503, "FIREBASE");
+  
+  const walletId = `partner_${partnerId}`;
+  const walletRef = db.ref(`wallets/${walletId}`);
+  let newBalance = 0;
+  
+  try {
+    await walletRef.transaction(current => {
+      if (!current) {
+        newBalance = amount;
+        return {
+          balance: amount,
+          transactions: [{
+            id: reference,
+            amount: amount,
+            type: "credit",
+            status: "completed",
+            description: description,
+            timestamp: new Date().toISOString(),
+            balanceAfter: amount
+          }]
+        };
+      }
+      
+      newBalance = (current.balance || 0) + amount;
+      const transactions = current.transactions || [];
+      
+      transactions.unshift({
+        id: reference,
+        amount: amount,
+        type: "credit",
+        status: "completed",
+        description: description,
+        timestamp: new Date().toISOString(),
+        balanceAfter: newBalance
+      });
+      
+      if (transactions.length > 100) transactions.pop();
+      
+      return {
+        ...current,
+        balance: newBalance,
+        transactions: transactions
+      };
+    });
+    
+    // Also update the developer record
+    const devSnapshot = await db.ref(`developers`).orderByChild('partnerId').equalTo(partnerId).once('value');
+    const developers = devSnapshot.val();
+    for (const uid in developers) {
+      await db.ref(`developers/${uid}`).update({ walletBalance: newBalance });
+      break;
+    }
+    
+    console.log(`💰 Credited ${amount} to wallet ${partnerId} | Ref: ${reference}`);
+    return { success: true, balance: newBalance };
+  } catch (err) {
+    console.error(`Failed to credit wallet ${partnerId}:`, err);
+    throw new AppError(`Failed to credit wallet: ${err.message}`, 500, "WALLET");
+  }
+}
+
+async function debitPartnerWallet(partnerId, amount, reference, description) {
+  if (!db) throw new AppError("Wallet system unavailable", 503, "FIREBASE");
+  
+  const walletId = `partner_${partnerId}`;
+  const walletRef = db.ref(`wallets/${walletId}`);
+  let result = null;
+  let newBalance = 0;
+  
+  await walletRef.transaction(current => {
+    if (!current || (current.balance || 0) < amount) {
+      result = { success: false, error: "Insufficient balance" };
+      return;
+    }
+    
+    newBalance = (current.balance || 0) - amount;
+    const transactions = current.transactions || [];
+    
+    transactions.unshift({
+      id: reference,
+      amount: amount,
+      type: "debit",
+      status: "completed",
+      description: description,
+      timestamp: new Date().toISOString(),
+      balanceAfter: newBalance
+    });
+    
+    if (transactions.length > 100) transactions.pop();
+    
+    result = { success: true, balance: newBalance };
+    
+    return {
+      ...current,
+      balance: newBalance,
+      transactions: transactions
+    };
+  });
+  
+  if (result && result.success) {
+    // Update the developer record
+    const devSnapshot = await db.ref(`developers`).orderByChild('partnerId').equalTo(partnerId).once('value');
+    const developers = devSnapshot.val();
+    for (const uid in developers) {
+      await db.ref(`developers/${uid}`).update({ walletBalance: newBalance });
+      break;
+    }
+    
+    console.log(`💸 Debited ${amount} from wallet ${partnerId} | Ref: ${reference}`);
+    return { success: true, balance: result.balance };
+  }
+  
+  throw new AppError(result?.error || "Insufficient balance", 400, "WALLET");
+}
+
+// ─────────────────────────────────────────────
 //  PHONE FORMATTING HELPERS
 // ─────────────────────────────────────────────
 
@@ -637,6 +838,31 @@ app.post("/paystack/webhook", async (req, res) => {
   const volumeInMB = meta.volumeInMB || meta.volume_in_mb;
   const ref = data.reference;
   const amount = data.amount ? data.amount / 100 : 0;
+  
+  // Check if this is a wallet funding transaction
+  const isWalletFunding = meta.purpose === "wallet_funding";
+  const partnerId = meta.partnerId;
+
+  if (isWalletFunding && partnerId) {
+    try {
+      await creditPartnerWallet(partnerId, amount, ref, `Wallet funding via Paystack`);
+      console.log(`✅ Partner wallet funded: ${partnerId} +${amount}`);
+      
+      if (db) {
+        await db.ref(`wallet_transactions/${ref}`).set({
+          partnerId,
+          amount,
+          type: "credit",
+          status: "completed",
+          reference: ref,
+          timestamp: new Date().toISOString()
+        });
+      }
+    } catch (err) {
+      console.error(`❌ Wallet funding failed: ${err.message}`);
+    }
+    return;
+  }
 
   const baseOrderData = { ref, phone, networkType, volumeInMB, amount, source: "paystack_webhook" };
 
@@ -1024,6 +1250,349 @@ app.post("/api/profit-settings", asyncHandler(async (req, res) => {
   res.json({ status: "success", settings });
 }));
 
+// ============================================================
+// NEW PARTNER API ENDPOINTS FOR EXTERNAL DEVELOPERS
+// ============================================================
+
+// GET /api/partner/wallet - Get partner wallet balance
+app.get("/api/partner/wallet", validatePartner, asyncHandler(async (req, res) => {
+  const partner = req.partner;
+  const wallet = await getPartnerWallet(partner.partnerId);
+  
+  res.json({
+    status: "success",
+    data: {
+      balance: wallet.balance,
+      currency: "GHS",
+      partnerId: partner.partnerId,
+      name: partner.name
+    }
+  });
+}));
+
+// GET /api/partner/bundles - Get available bundles for partners
+app.get("/api/partner/bundles", validatePartner, asyncHandler(async (req, res) => {
+  const network = req.query.network || null;
+  
+  const bundleData = {
+    mtn: [
+      { id: "mtn_1GB", name: "1GB", size: "1GB", volumeInMB: 1024, price: 4.30 },
+      { id: "mtn_2GB", name: "2GB", size: "2GB", volumeInMB: 2048, price: 8.60 },
+      { id: "mtn_5GB", name: "5GB", size: "5GB", volumeInMB: 5120, price: 21.70 },
+      { id: "mtn_10GB", name: "10GB", size: "10GB", volumeInMB: 10240, price: 39.00 },
+      { id: "mtn_15GB", name: "15GB", size: "15GB", volumeInMB: 15360, price: 57.00 },
+      { id: "mtn_20GB", name: "20GB", size: "20GB", volumeInMB: 20480, price: 77.10 },
+      { id: "mtn_30GB", name: "30GB", size: "30GB", volumeInMB: 30720, price: 116.00 },
+      { id: "mtn_50GB", name: "50GB", size: "50GB", volumeInMB: 51200, price: 186.00 },
+      { id: "mtn_100GB", name: "100GB", size: "100GB", volumeInMB: 102400, price: 370.00 }
+    ],
+    telecel: [
+      { id: "telecel_10GB", name: "10GB", size: "10GB", volumeInMB: 10240, price: 38.00 },
+      { id: "telecel_15GB", name: "15GB", size: "15GB", volumeInMB: 15360, price: 55.00 },
+      { id: "telecel_20GB", name: "20GB", size: "20GB", volumeInMB: 20480, price: 74.00 },
+      { id: "telecel_30GB", name: "30GB", size: "30GB", volumeInMB: 30720, price: 109.00 },
+      { id: "telecel_50GB", name: "50GB", size: "50GB", volumeInMB: 51200, price: 177.00 },
+      { id: "telecel_100GB", name: "100GB", size: "100GB", volumeInMB: 102400, price: 354.00 }
+    ],
+    airteltigo: [
+      { id: "at_1GB", name: "1GB", size: "1GB", volumeInMB: 1024, price: 3.90 },
+      { id: "at_2GB", name: "2GB", size: "2GB", volumeInMB: 2048, price: 7.80 },
+      { id: "at_5GB", name: "5GB", size: "5GB", volumeInMB: 5120, price: 19.40 },
+      { id: "at_10GB", name: "10GB", size: "10GB", volumeInMB: 10240, price: 39.00 },
+      { id: "at_15GB", name: "15GB", size: "15GB", volumeInMB: 15360, price: 59.00 },
+      { id: "at_20GB", name: "20GB", size: "20GB", volumeInMB: 20480, price: 78.50 }
+    ]
+  };
+
+  if (network && bundleData[network]) {
+    return res.json({ status: "success", data: bundleData[network], count: bundleData[network].length });
+  }
+  
+  const allBundles = [...bundleData.mtn, ...bundleData.telecel, ...bundleData.airteltigo];
+  res.json({ status: "success", data: allBundles, count: allBundles.length });
+}));
+
+// POST /api/partner/calculate - Calculate cost before order
+app.post("/api/partner/calculate", validatePartner, asyncHandler(async (req, res) => {
+  const { bundleSize, network } = req.body;
+  
+  if (!bundleSize || !network) {
+    throw new AppError("Missing bundleSize or network", 400, "VALIDATION");
+  }
+  
+  const bundleData = {
+    mtn: { "1GB": 4.30, "2GB": 8.60, "5GB": 21.70, "10GB": 39.00, "15GB": 57.00, "20GB": 77.10, "30GB": 116.00, "50GB": 186.00, "100GB": 370.00 },
+    telecel: { "10GB": 38.00, "15GB": 55.00, "20GB": 74.00, "30GB": 109.00, "50GB": 177.00, "100GB": 354.00 },
+    airteltigo: { "1GB": 3.90, "2GB": 7.80, "5GB": 19.40, "10GB": 39.00, "15GB": 59.00, "20GB": 78.50 }
+  };
+  
+  const networkLower = network.toLowerCase();
+  if (!bundleData[networkLower]) {
+    throw new AppError(`Invalid network: ${network}`, 400, "VALIDATION");
+  }
+  
+  const price = bundleData[networkLower][bundleSize];
+  if (!price) {
+    throw new AppError(`Invalid bundle size: ${bundleSize} for ${network}`, 400, "VALIDATION");
+  }
+  
+  res.json({
+    status: "success",
+    data: {
+      network: networkLower,
+      bundleSize: bundleSize,
+      price: price,
+      currency: "GHS"
+    }
+  });
+}));
+
+// POST /api/partner/order - Place order (deducts from wallet)
+app.post("/api/partner/order", validatePartner, asyncHandler(async (req, res) => {
+  const { phone, bundleSize, network, orderRef, customerName, customerEmail, webhookUrl } = req.body;
+  const partner = req.partner;
+  
+  if (!phone || !bundleSize || !network) {
+    throw new AppError("Missing required fields: phone, bundleSize, network", 400, "VALIDATION");
+  }
+  
+  // Get bundle price
+  const bundleData = {
+    mtn: { "1GB": { price: 4.30, volumeInMB: 1024 }, "2GB": { price: 8.60, volumeInMB: 2048 }, "5GB": { price: 21.70, volumeInMB: 5120 }, "10GB": { price: 39.00, volumeInMB: 10240 }, "15GB": { price: 57.00, volumeInMB: 15360 }, "20GB": { price: 77.10, volumeInMB: 20480 }, "30GB": { price: 116.00, volumeInMB: 30720 }, "50GB": { price: 186.00, volumeInMB: 51200 }, "100GB": { price: 370.00, volumeInMB: 102400 } },
+    telecel: { "10GB": { price: 38.00, volumeInMB: 10240 }, "15GB": { price: 55.00, volumeInMB: 15360 }, "20GB": { price: 74.00, volumeInMB: 20480 }, "30GB": { price: 109.00, volumeInMB: 30720 }, "50GB": { price: 177.00, volumeInMB: 51200 }, "100GB": { price: 354.00, volumeInMB: 102400 } },
+    airteltigo: { "1GB": { price: 3.90, volumeInMB: 1024 }, "2GB": { price: 7.80, volumeInMB: 2048 }, "5GB": { price: 19.40, volumeInMB: 5120 }, "10GB": { price: 39.00, volumeInMB: 10240 }, "15GB": { price: 59.00, volumeInMB: 15360 }, "20GB": { price: 78.50, volumeInMB: 20480 } }
+  };
+  
+  const networkLower = network.toLowerCase();
+  if (!bundleData[networkLower]) {
+    throw new AppError(`Invalid network: ${network}`, 400, "VALIDATION");
+  }
+  
+  const bundle = bundleData[networkLower][bundleSize];
+  if (!bundle) {
+    throw new AppError(`Invalid bundle size: ${bundleSize} for ${network}`, 400, "VALIDATION");
+  }
+  
+  // Apply profit if not MTN
+  let finalPrice = bundle.price;
+  if (networkLower !== "mtn") {
+    const settings = await getProfitSettings();
+    finalPrice = applyProfit(bundle.price, bundle.volumeInMB, networkLower, settings);
+  }
+  
+  // Check wallet balance
+  const wallet = await getPartnerWallet(partner.partnerId);
+  if (wallet.balance < finalPrice) {
+    throw new AppError(`Insufficient balance. Required: GHS ${finalPrice.toFixed(2)}, Available: GHS ${wallet.balance.toFixed(2)}`, 400, "INSUFFICIENT_BALANCE");
+  }
+  
+  // Format phone
+  const formattedPhone = formatPhoneLocal(phone);
+  
+  // Validate network compatibility
+  const prefix = formattedPhone.substring(0, 3);
+  const mtnPrefixes = ['024', '054', '055', '059', '053'];
+  const telPrefixes = ['020', '050', '026'];
+  const atPrefixes = ['027', '057'];
+  
+  if (networkLower === 'mtn' && !mtnPrefixes.includes(prefix)) {
+    throw new AppError(`${formattedPhone} is not an MTN number`, 400, "VALIDATION");
+  }
+  if (networkLower === 'telecel' && !telPrefixes.includes(prefix)) {
+    throw new AppError(`${formattedPhone} is not a Telecel number`, 400, "VALIDATION");
+  }
+  if (networkLower === 'airteltigo' && !atPrefixes.includes(prefix)) {
+    throw new AppError(`${formattedPhone} is not an AT number`, 400, "VALIDATION");
+  }
+  
+  const ref = orderRef || `PARTNER_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  
+  // Debit wallet first
+  await debitPartnerWallet(partner.partnerId, finalPrice, ref, `Purchase: ${bundleSize} ${network} for ${formattedPhone}`);
+  
+  try {
+    // Attempt delivery
+    const deliveryResult = await deliverData(formattedPhone, networkLower, bundle.volumeInMB, ref);
+    
+    // Save order
+    if (db) {
+      await db.ref(`partner_orders/${ref}`).set({
+        orderRef: ref,
+        partnerId: partner.partnerId,
+        partnerName: partner.name,
+        phone: formattedPhone,
+        network: networkLower,
+        bundleSize: bundleSize,
+        volumeInMB: bundle.volumeInMB,
+        amount: finalPrice,
+        status: "completed",
+        provider: deliveryResult.provider,
+        providerRef: deliveryResult.reference,
+        customerName: customerName || null,
+        customerEmail: customerEmail || null,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    // Send webhook if provided
+    if (webhookUrl) {
+      axios.post(webhookUrl, {
+        event: "order.completed",
+        orderRef: ref,
+        status: "completed",
+        phone: formattedPhone,
+        bundle: bundleSize,
+        network: networkLower,
+        amount: finalPrice
+      }).catch(err => console.warn(`Webhook failed: ${err.message}`));
+    }
+    
+    res.json({
+      status: "success",
+      message: "Data delivered successfully",
+      data: {
+        orderRef: ref,
+        phone: formattedPhone,
+        network: networkLower,
+        bundle: bundleSize,
+        amount: finalPrice,
+        walletBalanceAfter: (await getPartnerWallet(partner.partnerId)).balance,
+        provider: deliveryResult.provider,
+        providerReference: deliveryResult.reference
+      }
+    });
+    
+  } catch (err) {
+    // Refund wallet if delivery fails
+    await creditPartnerWallet(partner.partnerId, finalPrice, `refund_${ref}`, `Refund for failed order: ${ref}`);
+    
+    if (db) {
+      await db.ref(`partner_orders/${ref}`).set({
+        orderRef: ref,
+        partnerId: partner.partnerId,
+        partnerName: partner.name,
+        phone: formattedPhone,
+        network: networkLower,
+        bundleSize: bundleSize,
+        volumeInMB: bundle.volumeInMB,
+        amount: finalPrice,
+        status: "failed",
+        error: err.message,
+        timestamp: new Date().toISOString(),
+        refunded: true
+      });
+    }
+    
+    throw err;
+  }
+}));
+
+// GET /api/partner/order/:reference - Check order status
+app.get("/api/partner/order/:reference", validatePartner, asyncHandler(async (req, res) => {
+  const { reference } = req.params;
+  const partner = req.partner;
+  
+  if (!reference) {
+    throw new AppError("Reference parameter is required", 400, "VALIDATION");
+  }
+  
+  if (db) {
+    try {
+      const snapshot = await db.ref(`partner_orders/${reference}`).once("value");
+      const order = snapshot.val();
+      
+      if (order && order.partnerId === partner.partnerId) {
+        return res.json({
+          status: "success",
+          data: order
+        });
+      }
+    } catch (err) {
+      console.warn(`⚠️ Partner order lookup failed: ${err.message}`);
+    }
+  }
+  
+  res.status(404).json({
+    status: "error",
+    message: "Order not found",
+    code: "ORDER_NOT_FOUND"
+  });
+}));
+
+// GET /api/partner/transactions - Get partner transaction history
+app.get("/api/partner/transactions", validatePartner, asyncHandler(async (req, res) => {
+  const partner = req.partner;
+  const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+  
+  const wallet = await getPartnerWallet(partner.partnerId);
+  const transactions = (wallet.transactions || []).slice(0, limit);
+  
+  res.json({
+    status: "success",
+    data: {
+      transactions: transactions,
+      total: wallet.transactions?.length || 0,
+      returned: transactions.length
+    }
+  });
+}));
+
+// POST /api/partner/wallet/topup - Generate Paystack payment link
+app.post("/api/partner/wallet/topup", validatePartner, asyncHandler(async (req, res) => {
+  const { amount, email, callback_url } = req.body;
+  const partner = req.partner;
+  
+  if (!amount || amount < 10) {
+    throw new AppError("Amount must be at least GHS 10", 400, "VALIDATION");
+  }
+  
+  if (!email || !email.includes('@')) {
+    throw new AppError("Valid email is required", 400, "VALIDATION");
+  }
+  
+  if (!PAYSTACK_SECRET) {
+    throw new AppError("Paystack not configured", 503, "CONFIGURATION");
+  }
+  
+  const reference = `WALLET_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  
+  const response = await axios.post(
+    "https://api.paystack.co/transaction/initialize",
+    {
+      email: email,
+      amount: Math.round(amount * 100),
+      reference: reference,
+      callback_url: callback_url || "https://dataflow.kesug.com/wallet",
+      metadata: {
+        purpose: "wallet_funding",
+        partnerId: partner.partnerId,
+        partnerName: partner.name,
+        amount: amount
+      }
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${PAYSTACK_SECRET}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+  
+  if (response.data?.status) {
+    res.json({
+      status: "success",
+      data: {
+        authorization_url: response.data.data.authorization_url,
+        reference: reference,
+        amount: amount,
+        callback_url: callback_url
+      }
+    });
+  } else {
+    throw new AppError("Failed to initialize payment", 500, "PAYSTACK");
+  }
+}));
+
 // ─────────────────────────────────────────────
 //  404 HANDLER
 // ─────────────────────────────────────────────
@@ -1098,15 +1667,16 @@ ${col("║  AirtelTigo → HubNetGH", !!HUBNET_API_KEY)}        ║
 ${col("║  Paystack Webhook", !!PAYSTACK_SECRET)}        ║
 ${col("║  /deliver Auth", !!DELIVER_SECRET)}        ║
 ${col("║  Firebase", !!db)}        ║
+${col("║  Partner API", true)}        ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Features:                                                  ║
-║  • Retry logic (${MAX_RETRIES}x exponential backoff)                   ║
-║  • Bidirectional failover (MTN ↔ Telecel/AT)               ║
-║  • HubNetGH now supports MTN, Telecel, AirtelTigo          ║
-║  • Memory protection (${MAX_REF_SIZE} max refs)                        ║
-║  • Firebase queue (${failedSaveQueue.length} pending)                    ║
-║  • Enhanced status lookup (Firebase first)                 ║
-║  • Customer-friendly error messages                        ║
+║  Partner API Endpoints:                                     ║
+║  • GET  /api/partner/wallet                                 ║
+║  • GET  /api/partner/bundles                                ║
+║  • POST /api/partner/calculate                              ║
+║  • POST /api/partner/order                                  ║
+║  • GET  /api/partner/order/:reference                       ║
+║  • GET  /api/partner/transactions                           ║
+║  • POST /api/partner/wallet/topup                           ║
 ╚══════════════════════════════════════════════════════════════╝`);
 });
 
