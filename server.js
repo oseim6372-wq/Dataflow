@@ -41,23 +41,25 @@ const MAX_REF_SIZE = 10000;
 const failedSaveQueue = [];
 let isProcessingQueue = false;
 
-// Network providers with BIDIRECTIONAL failover support
+// Network providers with BIDIRECTIONAL failover for Telecel/AirtelTigo ONLY
+// MTN has NO fallback - RemaData only
 const NETWORK_PROVIDER = {
   mtn: { 
     name: "RemaData", 
     primary: true,
-    fallback: "HubNetGH",
-    fallbackNetwork: "mtn"
+    hasFallback: false  // MTN has no fallback
   },
   telecel: { 
     name: "HubNetGH", 
     primary: true,
+    hasFallback: true,
     fallback: "RemaData",
     fallbackNetwork: "telecel"
   },
   airteltigo: { 
     name: "HubNetGH", 
     primary: true,
+    hasFallback: true,
     fallback: "RemaData",
     fallbackNetwork: "airteltigo"
   },
@@ -468,7 +470,7 @@ async function deliverViaRemaData(phone, volumeInMB, reference) {
   return { success: true, reference: remaReference, data: response.data, provider: "RemaData" };
 }
 
-// ✅ FIXED: HubNetGH now correctly handles all network types (mtn, telecel, airteltigo)
+// HubNetGH handles all network types (mtn, telecel, airteltigo)
 async function deliverViaHubNet(phone, networkType, volumeInMB, reference) {
   if (!HUBNET_API_KEY) {
     throw new AppError(
@@ -477,7 +479,7 @@ async function deliverViaHubNet(phone, networkType, volumeInMB, reference) {
     );
   }
   
-  // ✅ FIX: Properly map all network types to HubNetGH expected values
+  // Map all network types to HubNetGH expected values
   let network;
   switch (networkType) {
     case "airteltigo":
@@ -527,7 +529,7 @@ async function deliverViaHubNet(phone, networkType, volumeInMB, reference) {
 }
 
 // ─────────────────────────────────────────────
-//  DELIVERY ORCHESTRATOR WITH BIDIRECTIONAL FAILOVER
+//  DELIVERY ORCHESTRATOR WITH BIDIRECTIONAL FAILOVER (Telecel/AirtelTigo ONLY)
 // ─────────────────────────────────────────────
 
 async function deliverData(phone, networkType, volumeInMB, reference = null) {
@@ -542,35 +544,46 @@ async function deliverData(phone, networkType, volumeInMB, reference = null) {
   }
   
   const primaryProvider = providerConfig.name;
+  
+  // MTN has NO fallback - direct delivery only
+  if (net === "mtn") {
+    try {
+      console.log(`📡 Delivering MTN via ${primaryProvider} (no fallback)`);
+      return await deliverViaRemaData(phone, volumeInMB, reference);
+    } catch (error) {
+      // For MTN, just throw the error directly with customer-friendly message
+      const customerMessage = getCustomerFriendlyMessage(net, error.message);
+      throw new AppError(
+        customerMessage,
+        503,
+        "PROVIDER",
+        { network: net, primaryProvider, error: error.message }
+      );
+    }
+  }
+  
+  // For Telecel and AirtelTigo - bidirectional failover
   const fallbackProvider = providerConfig.fallback;
   const fallbackNetwork = providerConfig.fallbackNetwork;
   
-  // Track all errors for final customer notification
   const errors = [];
   
-  // Try primary provider
+  // Try primary provider (HubNetGH for Telecel/AirtelTigo)
   console.log(`📡 Trying primary provider: ${primaryProvider} for ${net}`);
   try {
-    if (primaryProvider === "RemaData") {
-      return await deliverViaRemaData(phone, volumeInMB, reference);
-    } else {
-      return await deliverViaHubNet(phone, net, volumeInMB, reference);
-    }
+    return await deliverViaHubNet(phone, net, volumeInMB, reference);
   } catch (primaryError) {
     const errorMsg = `${primaryProvider}: ${primaryError.message}`;
     errors.push(errorMsg);
     console.warn(`⚠️ Primary provider ${primaryProvider} failed: ${primaryError.message}`);
     
-    // Try fallback provider if configured
+    // Try fallback provider (RemaData)
     if (fallbackProvider) {
       console.log(`🔄 Attempting fallback: ${fallbackProvider} for ${net}`);
       try {
         let result;
         if (fallbackProvider === "RemaData") {
           result = await deliverViaRemaData(phone, volumeInMB, reference);
-        } else if (fallbackProvider === "HubNetGH") {
-          // Pass the fallbackNetwork (e.g., "mtn", "telecel", "airteltigo")
-          result = await deliverViaHubNet(phone, fallbackNetwork, volumeInMB, reference);
         } else {
           throw new Error(`Unknown fallback provider: ${fallbackProvider}`);
         }
@@ -692,12 +705,12 @@ app.get("/health", (req, res) => {
     timestamp: new Date().toISOString(),
     criticalIssues,
     providers: {
-      mtn: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY },
-      telecel: { provider: "HubNetGH", configured: !!HUBNET_API_KEY, operational: !!HUBNET_API_KEY },
-      airteltigo: { provider: "HubNetGH", configured: !!HUBNET_API_KEY, operational: !!HUBNET_API_KEY },
+      mtn: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY, hasFallback: false },
+      telecel: { provider: "HubNetGH", configured: !!HUBNET_API_KEY, operational: !!HUBNET_API_KEY, hasFallback: true, fallbackProvider: "RemaData" },
+      airteltigo: { provider: "HubNetGH", configured: !!HUBNET_API_KEY, operational: !!HUBNET_API_KEY, hasFallback: true, fallbackProvider: "RemaData" },
     },
     failover: {
-      mtn: "RemaData → HubNetGH",
+      mtn: "No fallback - RemaData only",
       telecel: "HubNetGH → RemaData",
       airteltigo: "HubNetGH → RemaData"
     },
@@ -1092,17 +1105,17 @@ app.listen(PORT, () => {
 ║   🚀  DataFlow GH Backend — Production Ready                 ║
 ║   📡  Port: ${String(PORT).padEnd(37)}║
 ╠══════════════════════════════════════════════════════════════╣
-${col("║  MTN → RemaData", !!REMADATA_API_KEY)}        ║
-${col("║  Telecel → HubNetGH", !!HUBNET_API_KEY)}        ║
-${col("║  AirtelTigo → HubNetGH", !!HUBNET_API_KEY)}        ║
+${col("║  MTN → RemaData (NO FALLBACK)", !!REMADATA_API_KEY)}        ║
+${col("║  Telecel → HubNetGH (failover to RemaData)", !!HUBNET_API_KEY)}        ║
+${col("║  AirtelTigo → HubNetGH (failover to RemaData)", !!HUBNET_API_KEY)}        ║
 ${col("║  Paystack Webhook", !!PAYSTACK_SECRET)}        ║
 ${col("║  /deliver Auth", !!DELIVER_SECRET)}        ║
 ${col("║  Firebase", !!db)}        ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Features:                                                  ║
 ║  • Retry logic (${MAX_RETRIES}x exponential backoff)                   ║
-║  • Bidirectional failover (MTN ↔ Telecel/AT)               ║
-║  • HubNetGH now supports MTN, Telecel, AirtelTigo          ║
+║  • Bidirectional failover (Telecel ↔ RemaData)             ║
+║  • MTN: RemaData only - NO FALLBACK                         ║
 ║  • Memory protection (${MAX_REF_SIZE} max refs)                        ║
 ║  • Firebase queue (${failedSaveQueue.length} pending)                    ║
 ║  • Enhanced status lookup (Firebase first)                 ║
