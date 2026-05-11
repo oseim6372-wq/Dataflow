@@ -12,10 +12,69 @@ app.use(express.json());
 app.use(cors({ origin: '*' }));
 
 // ============================================================
-// MTN KYC CONFIGURATION - USING API KEY ONLY
+// MTN KYC CONFIGURATION - USING OAUTH2 (CORRECT METHOD)
 // ============================================================
-const MTN_API_KEY = process.env.MTN_API_KEY || 'WsAWhYfZZaFckbrQFNqeYQlQnJLQ0QAu';
+const MTN_CLIENT_ID = process.env.MTN_CLIENT_ID || 'WsAWhYfZZaFckbrQFNqeYQlQnJLQ0QAu';     // Your Consumer Key
+const MTN_CLIENT_SECRET = process.env.MTN_CLIENT_SECRET || 'DU1oXXXXXXXX5Nvd';            // Your Consumer Secret (from screenshot)
+const MTN_TOKEN_URL = 'https://api.mtn.com/oauth/client_credential/accesstoken';
 const MTN_API_BASE = 'https://api.mtn.com/v1/customers';
+
+// Token cache
+let cachedToken = null;
+let tokenExpiry = null;
+
+// ============================================================
+// GET OAUTH2 ACCESS TOKEN
+// ============================================================
+async function getMtnAccessToken() {
+  // Return cached token if still valid (with 5 min buffer)
+  if (cachedToken && tokenExpiry && Date.now() < tokenExpiry - 300000) {
+    console.log('📦 Using cached OAuth2 token');
+    return cachedToken;
+  }
+
+  console.log('\n🔐 Getting OAuth2 token from MTN...');
+  console.log(`   Client ID: ${MTN_CLIENT_ID.substring(0, 15)}...`);
+  console.log(`   Token URL: ${MTN_TOKEN_URL}`);
+
+  try {
+    // Create Basic Auth header from Client ID and Secret
+    const credentials = Buffer.from(`${MTN_CLIENT_ID}:${MTN_CLIENT_SECRET}`).toString('base64');
+
+    const response = await axios.post(
+      MTN_TOKEN_URL,
+      'grant_type=client_credentials',
+      {
+        headers: {
+          'Authorization': `Basic ${credentials}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        timeout: 30000
+      }
+    );
+
+    if (response.data && response.data.access_token) {
+      cachedToken = response.data.access_token;
+      const expiresIn = response.data.expires_in || 3600;
+      tokenExpiry = Date.now() + (expiresIn * 1000);
+      
+      console.log(`✅ OAuth2 token obtained! Expires in ${expiresIn} seconds`);
+      console.log(`   Token: ${cachedToken.substring(0, 30)}...`);
+      return cachedToken;
+    } else {
+      throw new Error('No access_token in response');
+    }
+  } catch (error) {
+    console.error('❌ OAuth2 token error:');
+    if (error.response) {
+      console.error(`   Status: ${error.response.status}`);
+      console.error(`   Data:`, error.response.data);
+    } else {
+      console.error(`   Message: ${error.message}`);
+    }
+    throw new Error(`MTN authentication failed: ${error.response?.data?.error_description || error.message}`);
+  }
+}
 
 // ============================================================
 // FORMAT PHONE NUMBER TO E.123 STANDARD
@@ -47,7 +106,7 @@ function isValidMtnNumber(phone) {
 }
 
 // ============================================================
-// FETCH KYC FROM MTN - USING API KEY ONLY
+// FETCH KYC FROM MTN - USING OAUTH2 BEARER TOKEN
 // ============================================================
 async function fetchMtnKyc(phoneNumber) {
   const formattedPhone = formatPhoneForMtn(phoneNumber);
@@ -59,12 +118,13 @@ async function fetchMtnKyc(phoneNumber) {
   console.log(`   Formatted: ${formattedPhone}`);
   console.log(`   URL: ${url}`);
   console.log(`   Transaction ID: ${transactionId}`);
-  console.log(`   API Key: ${MTN_API_KEY.substring(0, 15)}...`);
 
   try {
+    const token = await getMtnAccessToken();
+
     const response = await axios.get(url, {
       headers: {
-        'x-api-key': MTN_API_KEY,
+        'Authorization': `Bearer ${token}`,
         'Accept': 'application/json',
         'transactionId': transactionId
       },
@@ -98,11 +158,9 @@ async function fetchMtnKyc(phoneNumber) {
       if (error.response.status === 404) {
         return { success: false, error: 'Customer not found in MTN records. Please check the number.' };
       } else if (error.response.status === 401) {
-        return { success: false, error: 'API Key invalid or expired. Please contact support.' };
+        return { success: false, error: 'OAuth2 token invalid or expired. Please contact support.' };
       } else if (error.response.status === 403) {
-        return { success: false, error: 'Access forbidden. Your API key may not have KYC permissions.' };
-      } else if (error.response.status === 400) {
-        return { success: false, error: 'Invalid request. Please check the phone number format.' };
+        return { success: false, error: 'Access forbidden. Your credentials may not have KYC permissions.' };
       }
     } else if (error.request) {
       console.error(`   No response received`);
@@ -117,30 +175,165 @@ async function fetchMtnKyc(phoneNumber) {
 }
 
 // ============================================================
+// REMADATA CONFIGURATION
+// ============================================================
+const REMADATA_BASE = process.env.REMADATA_BASE || 'https://api.remadata.net';
+const REMADATA_TOKEN = process.env.REMADATA_TOKEN || '';
+const REMADATA_SENDER = process.env.REMADATA_SENDER || '';
+
+// ============================================================
 // HEALTH CHECK ENDPOINT
 // ============================================================
 app.get('/health', (req, res) => {
   res.json({
     status: 'OK',
     timestamp: new Date().toISOString(),
-    kycApiConfigured: !!MTN_API_KEY,
+    mtnOAuthConfigured: !!(MTN_CLIENT_ID && MTN_CLIENT_SECRET),
+    remaDataConfigured: !!REMADATA_TOKEN,
     endpoints: [
-      'GET /api/kyc/lookup?phone=024XXXXXX  → KYC name lookup',
-      'GET /health                           → Health check'
+      'GET  /api/bundles?network=mtn → List bundles',
+      'POST /deliver → Deliver bundle',
+      'GET  /api/kyc/lookup?phone=024XXXXXX → KYC name lookup (OAuth2)',
+      'GET  /health → Health check'
     ]
   });
 });
 
 // ============================================================
-// KYC LOOKUP ENDPOINT
-// Called by the frontend phone field (MTN numbers only)
-// GET /api/kyc/lookup?phone=0241234567
+// BUNDLES ENDPOINT
+// ============================================================
+app.get('/api/bundles', async (req, res) => {
+  const { network } = req.query;
+
+  console.log(`\n📦 Bundles Request — network: ${network}`);
+
+  if (!network) {
+    return res.status(400).json({ status: 'error', message: 'network query param required' });
+  }
+
+  const networkMap = {
+    mtn: 'MTN',
+    telecel: 'TELECEL',
+    airteltigo: 'AIRTELTIGO'
+  };
+  const remaNetwork = networkMap[network.toLowerCase()];
+  if (!remaNetwork) {
+    return res.status(400).json({ status: 'error', message: `Unknown network: ${network}` });
+  }
+
+  try {
+    const response = await axios.get(`${REMADATA_BASE}/api/v1/bundles`, {
+      headers: {
+        'Authorization': `Bearer ${REMADATA_TOKEN}`,
+        'Accept': 'application/json'
+      },
+      params: { network: remaNetwork },
+      timeout: 15000
+    });
+
+    const raw = response.data?.data || response.data || [];
+    const bundles = (Array.isArray(raw) ? raw : []).map(b => ({
+      volumeInMB: Number(b.volume || b.volumeInMB || b.size || 0),
+      price: parseFloat(b.price || b.amount || 0),
+      name: b.name || b.description || '',
+      network: remaNetwork
+    })).filter(b => b.volumeInMB > 0 && b.price > 0);
+
+    console.log(`✅ Returning ${bundles.length} bundles for ${remaNetwork}`);
+    res.json({ status: 'success', data: bundles });
+
+  } catch (err) {
+    console.error('❌ Bundles fetch error:', err.response?.status, err.response?.data || err.message);
+    res.status(502).json({
+      status: 'error',
+      message: err.response?.data?.message || 'Failed to fetch bundles from provider'
+    });
+  }
+});
+
+// ============================================================
+// DELIVER ENDPOINT
+// ============================================================
+app.post('/deliver', async (req, res) => {
+  const { phone, networkType, volumeInMB, ref } = req.body;
+
+  console.log('\n=========================================');
+  console.log('🚀 Delivery Request');
+  console.log(`   Phone:       ${phone}`);
+  console.log(`   Network:     ${networkType}`);
+  console.log(`   VolumeInMB:  ${volumeInMB}`);
+  console.log(`   Ref:         ${ref}`);
+  console.log('=========================================');
+
+  if (!phone || !networkType || !volumeInMB || !ref) {
+    return res.status(400).json({
+      status: 'error',
+      message: 'Missing required fields: phone, networkType, volumeInMB, ref'
+    });
+  }
+
+  const networkMap = {
+    mtn: 'MTN',
+    telecel: 'TELECEL',
+    airteltigo: 'AIRTELTIGO'
+  };
+  const remaNetwork = networkMap[networkType.toLowerCase()] || networkType.toUpperCase();
+
+  try {
+    const payload = {
+      phone: phone.startsWith('0') ? '233' + phone.substring(1) : phone,
+      network: remaNetwork,
+      volume: Number(volumeInMB),
+      ref: ref,
+      sender: REMADATA_SENDER
+    };
+
+    console.log('📤 Sending to RemaData:', payload);
+
+    const response = await axios.post(`${REMADATA_BASE}/api/v1/send`, payload, {
+      headers: {
+        'Authorization': `Bearer ${REMADATA_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      timeout: 30000
+    });
+
+    const result = response.data;
+    console.log('✅ RemaData response:', JSON.stringify(result, null, 2));
+
+    if (result.status === 'success' || result.success === true) {
+      res.json({
+        status: 'success',
+        message: result.message || 'Bundle delivered successfully',
+        reference: result.reference || result.data?.reference || ref,
+        orderId: ref
+      });
+    } else {
+      console.warn('⚠️ RemaData returned non-success:', result);
+      res.status(400).json({
+        status: 'error',
+        message: result.message || 'Delivery failed. Please check provider logs.'
+      });
+    }
+
+  } catch (err) {
+    console.error('❌ Delivery error:', err.response?.status, err.response?.data || err.message);
+    res.status(502).json({
+      status: 'error',
+      message: err.response?.data?.message || 'Failed to deliver bundle. Please retry.'
+    });
+  }
+});
+
+// ============================================================
+// KYC LOOKUP ENDPOINT - USING OAUTH2
 // ============================================================
 app.get('/api/kyc/lookup', async (req, res) => {
   const { phone } = req.query;
 
   console.log('\n=========================================');
-  console.log('📞 KYC Lookup Request');
+  console.log('📞 KYC Lookup Request (OAuth2)');
   console.log(`   Phone: ${phone}`);
   console.log('=========================================');
 
@@ -160,11 +353,11 @@ app.get('/api/kyc/lookup', async (req, res) => {
     });
   }
 
-  if (!MTN_API_KEY) {
+  if (!MTN_CLIENT_ID || !MTN_CLIENT_SECRET) {
     return res.status(500).json({
       success: false,
-      error: 'KYC service not configured',
-      code: 'NO_API_KEY'
+      error: 'KYC service not configured - missing OAuth2 credentials',
+      code: 'NO_CREDENTIALS'
     });
   }
 
@@ -201,15 +394,18 @@ app.get('/api/kyc/lookup', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════════════════╗
-║   🚀 DataFlow Backend Server Running                          ║
+║   🚀 DataFlow Backend Server Running (OAuth2)                ║
 ║   📡 Port: ${PORT}                                              ║
-║   🔑 MTN API Key: ${MTN_API_KEY ? '✅ Configured' : '❌ MISSING'}            ║
+║   🔑 MTN OAuth2: ${MTN_CLIENT_ID && MTN_CLIENT_SECRET ? '✅ Configured' : '❌ MISSING'}   ║
+║   📦 RemaData:   ${REMADATA_TOKEN ? '✅ Configured' : '❌ MISSING'}                       ║
 ║                                                              ║
 ║   📮 Endpoints:                                              ║
 ║      GET /api/kyc/lookup?phone=024XXXXXX  → KYC lookup      ║
+║      GET /api/bundles?network=mtn         → Bundles list    ║
+║      POST /deliver                         → Deliver bundle  ║
 ║      GET /health                           → Health check    ║
 ║                                                              ║
-║   📝 Test with:                                             ║
+║   📝 Test KYC:                                              ║
 ║      curl "http://localhost:${PORT}/api/kyc/lookup?phone=0244502480" ║
 ╚══════════════════════════════════════════════════════════════╝
   `);
