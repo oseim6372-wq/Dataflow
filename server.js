@@ -12,11 +12,12 @@ app.use(express.json());
 app.use(cors({ origin: '*' }));
 
 // ============================================================
-// MTN KYC CONFIGURATION - OAUTH 2.0 (REQUIRED)
+// MTN KYC CONFIGURATION - FROM SWAGGER FILE
 // ============================================================
 const MTN_CLIENT_ID = process.env.MTN_CLIENT_ID || 'WsAWhYfZZaFckbrQFNqeYQlQnJLQ0QAu';
-const MTN_CLIENT_SECRET = process.env.MTN_CLIENT_SECRET || 'DU1oXXXXXXXX5Nvd'; // YOUR CONSUMER SECRET
-const MTN_TOKEN_URL = 'https://api.mtn.com/v1/oauth/access_token';  // Correct endpoint!
+const MTN_CLIENT_SECRET = process.env.MTN_CLIENT_SECRET || 'DU1oXXXXXXXX5Nvd';
+// CORRECT URLs from Swagger:
+const MTN_TOKEN_URL = 'https://api.mtn.com/oauth/client_credential/accesstoken';
 const MTN_API_BASE = 'https://api.mtn.com/v1/customers';
 
 // Token cache
@@ -58,77 +59,64 @@ const LOCAL_BUNDLES = {
 };
 
 // ============================================================
-// GET OAUTH 2.0 ACCESS TOKEN (CORRECT METHOD)
+// GET OAUTH2 ACCESS TOKEN (EXACTLY AS PER SWAGGER)
 // ============================================================
 async function getMtnAccessToken() {
-  // Return cached token if still valid (with 5 min buffer)
+  // Return cached token if still valid
   if (cachedAccessToken && tokenExpiresAt && Date.now() < tokenExpiresAt - 300000) {
-    console.log('📦 Using cached OAuth 2.0 token');
+    console.log('📦 Using cached OAuth2 token');
     return cachedAccessToken;
   }
 
-  console.log('\n🔐 Getting OAuth 2.0 access token from MTN...');
+  console.log('\n🔐 Getting OAuth2 token from MTN...');
   console.log(`   Token URL: ${MTN_TOKEN_URL}`);
-  console.log(`   Client ID: ${MTN_CLIENT_ID ? MTN_CLIENT_ID.substring(0, 15) + '...' : 'NOT SET'}`);
-  console.log(`   Client Secret: ${MTN_CLIENT_SECRET ? '***' + MTN_CLIENT_SECRET.substring(MTN_CLIENT_SECRET.length - 4) : 'NOT SET'}`);
-
-  if (!MTN_CLIENT_ID || !MTN_CLIENT_SECRET) {
-    console.error('❌ Missing MTN credentials!');
-    throw new Error('MTN credentials not configured');
-  }
+  console.log(`   Client ID: ${MTN_CLIENT_ID.substring(0, 15)}...`);
+  console.log(`   Client Secret: ${MTN_CLIENT_SECRET ? '***' + MTN_CLIENT_SECRET.slice(-4) : 'NOT SET'}`);
 
   try {
-    // According to MTN docs: POST to token endpoint with client_id and client_secret in body
+    // According to Swagger: OAuth2 with client_credentials flow
+    // Use Basic Authentication with Client ID and Secret
+    const credentials = Buffer.from(`${MTN_CLIENT_ID}:${MTN_CLIENT_SECRET}`).toString('base64');
+
     const response = await axios.post(
       MTN_TOKEN_URL,
-      `grant_type=client_credentials&client_id=${MTN_CLIENT_ID}&client_secret=${MTN_CLIENT_SECRET}`,
+      'grant_type=client_credentials',
       {
         headers: {
+          'Authorization': `Basic ${credentials}`,
           'Content-Type': 'application/x-www-form-urlencoded'
         },
         timeout: 30000
       }
     );
 
-    console.log('📥 Token Response:', JSON.stringify(response.data, null, 2));
-
-    // Extract access token from response
-    // The response format from MTN includes the access token
-    let accessToken = null;
+    console.log('📥 Token Response Status:', response.status);
     
-    if (response.data.access_token) {
-      accessToken = response.data.access_token;
-    } else if (response.data.token) {
-      accessToken = response.data.token;
-    } else if (response.data.data?.access_token) {
-      accessToken = response.data.data.access_token;
-    }
+    const { access_token, expires_in } = response.data;
     
-    if (!accessToken) {
-      console.error('❌ Could not extract access token from response');
-      throw new Error('No access token in response');
+    if (!access_token) {
+      console.error('❌ No access_token in response:', response.data);
+      throw new Error('No access token received');
     }
 
-    cachedAccessToken = accessToken;
-    // Tokens typically expire in 3600 seconds (1 hour)
-    const expiresIn = response.data.expires_in || 3600;
-    tokenExpiresAt = Date.now() + (expiresIn * 1000);
+    cachedAccessToken = access_token;
+    tokenExpiresAt = Date.now() + ((expires_in || 3600) * 1000);
     
-    console.log(`✅ OAuth 2.0 token obtained successfully!`);
-    console.log(`   Token: ${accessToken.substring(0, 30)}...`);
-    console.log(`   Expires in: ${expiresIn} seconds (${Math.round(expiresIn / 60)} minutes)`);
+    console.log(`✅ OAuth2 token obtained!`);
+    console.log(`   Token: ${access_token.substring(0, 30)}...`);
+    console.log(`   Expires in: ${expires_in || 3600} seconds`);
     
     return cachedAccessToken;
 
   } catch (error) {
-    console.error('❌ OAuth 2.0 token error:');
+    console.error('❌ OAuth2 token error:');
     if (error.response) {
       console.error(`   Status: ${error.response.status}`);
-      console.error(`   Data:`, error.response.data);
+      console.error(`   Data:`, JSON.stringify(error.response.data, null, 2));
     } else {
       console.error(`   Message: ${error.message}`);
     }
-    throw new Error(`MTN authentication failed: ${error.response?.data?.error_description || error.message}`);
+    throw new Error(`MTN authentication failed: ${error.response?.data?.message || error.message}`);
   }
 }
 
@@ -162,7 +150,7 @@ function isValidMtnNumber(phone) {
 }
 
 // ============================================================
-// FETCH KYC FROM MTN USING OAUTH 2.0 TOKEN
+// FETCH KYC FROM MTN USING OAUTH2 TOKEN
 // ============================================================
 async function fetchMtnKyc(phoneNumber) {
   const formattedPhone = formatPhoneForMtn(phoneNumber);
@@ -176,10 +164,8 @@ async function fetchMtnKyc(phoneNumber) {
   console.log(`   Transaction ID: ${transactionId}`);
 
   try {
-    // Get OAuth 2.0 access token first
     const accessToken = await getMtnAccessToken();
     
-    // Make API call with Bearer token
     const response = await axios.get(url, {
       headers: {
         'Authorization': `Bearer ${accessToken}`,
@@ -214,38 +200,30 @@ async function fetchMtnKyc(phoneNumber) {
       console.error(`   Data:`, JSON.stringify(error.response.data, null, 2));
       
       if (error.response.status === 404) {
-        return { success: false, error: 'Customer not found in MTN records. Please check the number.' };
+        return { success: false, error: 'Customer not found in MTN records.' };
       } else if (error.response.status === 401) {
-        return { success: false, error: 'OAuth token invalid or expired. Please contact support.' };
+        return { success: false, error: 'Authentication failed. Please check your MTN credentials.' };
       } else if (error.response.status === 403) {
-        return { success: false, error: 'Access forbidden. Your credentials may not have KYC permissions.' };
+        return { success: false, error: 'Access forbidden. Your app may not have KYC permissions.' };
       }
-    } else if (error.request) {
-      console.error(`   No response received`);
-      return { success: false, error: 'Network error - Could not reach MTN servers.' };
     }
     
     return {
       success: false,
-      error: error.response?.data?.message || 'Failed to fetch customer KYC data. Please try again.'
+      error: error.response?.data?.message || 'Failed to fetch customer KYC data'
     };
   }
 }
 
 // ============================================================
-// HEALTH CHECK ENDPOINT
+// HEALTH CHECK
 // ============================================================
 app.get('/health', (req, res) => {
   res.json({
     status: 'OK',
     timestamp: new Date().toISOString(),
     mtnOAuthConfigured: !!(MTN_CLIENT_ID && MTN_CLIENT_SECRET),
-    endpoints: [
-      'GET /api/bundles?network=mtn|telecel|airteltigo → List bundles',
-      'POST /deliver → Deliver bundle',
-      'GET /api/kyc/lookup?phone=024XXXXXX → KYC name lookup (OAuth 2.0)',
-      'GET /health → Health check'
-    ]
+    endpoints: ['GET /api/bundles', 'POST /deliver', 'GET /api/kyc/lookup', 'GET /health']
   });
 });
 
@@ -262,21 +240,10 @@ app.get('/api/bundles', async (req, res) => {
   }
 
   const networkKey = network.toLowerCase();
-  let bundles = [];
+  let bundles = LOCAL_BUNDLES[networkKey] || [];
 
-  if (LOCAL_BUNDLES[networkKey]) {
-    bundles = LOCAL_BUNDLES[networkKey];
-    console.log(`✅ Returning ${bundles.length} bundles for ${networkKey}`);
-  } else {
-    bundles = [];
-    console.log(`⚠️ No bundles found for ${networkKey}`);
-  }
-
-  res.json({ 
-    status: 'success', 
-    data: bundles,
-    source: 'local'
-  });
+  console.log(`✅ Returning ${bundles.length} bundles for ${networkKey}`);
+  res.json({ status: 'success', data: bundles });
 });
 
 // ============================================================
@@ -285,11 +252,7 @@ app.get('/api/bundles', async (req, res) => {
 app.post('/deliver', async (req, res) => {
   const { phone, networkType, volumeInMB, ref } = req.body;
 
-  console.log(`\n🚀 Delivery Request:`);
-  console.log(`   Phone: ${phone}`);
-  console.log(`   Network: ${networkType}`);
-  console.log(`   Volume: ${volumeInMB}MB`);
-  console.log(`   Ref: ${ref}`);
+  console.log(`\n🚀 Delivery Request: ${phone}, ${networkType}, ${volumeInMB}MB, Ref: ${ref}`);
 
   if (!phone || !networkType || !volumeInMB || !ref) {
     return res.status(400).json({
@@ -298,7 +261,8 @@ app.post('/deliver', async (req, res) => {
     });
   }
 
-  console.log(`✅ Delivery processed for ${phone}`);
+  // Simulate delivery (replace with actual API call)
+  console.log(`✅ Delivery simulated for ${phone}`);
   
   res.json({
     status: 'success',
@@ -309,29 +273,27 @@ app.post('/deliver', async (req, res) => {
 });
 
 // ============================================================
-// KYC LOOKUP ENDPOINT - USING OAUTH 2.0
+// KYC LOOKUP ENDPOINT
 // ============================================================
 app.get('/api/kyc/lookup', async (req, res) => {
   const { phone } = req.query;
 
   console.log('\n=========================================');
-  console.log('📞 KYC Lookup Request (OAuth 2.0)');
+  console.log('📞 KYC Lookup Request');
   console.log(`   Phone: ${phone}`);
   console.log('=========================================');
 
   if (!phone) {
     return res.status(400).json({
       success: false,
-      error: 'Phone number is required',
-      code: 'MISSING_PHONE'
+      error: 'Phone number is required'
     });
   }
 
   if (!isValidMtnNumber(phone)) {
     return res.status(400).json({
       success: false,
-      error: 'Invalid MTN number. MTN numbers start with 024, 054, 055, 053, or 059',
-      code: 'INVALID_NETWORK'
+      error: 'Invalid MTN number. MTN numbers start with 024, 054, 055, 053, or 059'
     });
   }
 
@@ -339,7 +301,7 @@ app.get('/api/kyc/lookup', async (req, res) => {
     const result = await fetchMtnKyc(phone);
 
     if (result.success) {
-      console.log(`✅ Returning KYC data for ${phone}: ${result.data.fullName || 'Customer Found'}`);
+      console.log(`✅ Returning KYC data for ${phone}`);
       res.json({
         success: true,
         data: result.data,
@@ -348,16 +310,14 @@ app.get('/api/kyc/lookup', async (req, res) => {
     } else {
       res.status(400).json({
         success: false,
-        error: result.error,
-        code: 'KYC_LOOKUP_FAILED'
+        error: result.error
       });
     }
   } catch (error) {
     console.error('❌ Unexpected error:', error);
     res.status(500).json({
       success: false,
-      error: 'Internal server error. Please try again.',
-      code: 'INTERNAL_ERROR'
+      error: 'Internal server error. Please try again.'
     });
   }
 });
@@ -367,23 +327,20 @@ app.get('/api/kyc/lookup', async (req, res) => {
 // ============================================================
 app.listen(PORT, () => {
   console.log(`
-╔══════════════════════════════════════════════════════════════════════╗
-║   🚀 DataFlow Backend Server Running (OAuth 2.0)                      ║
-║   📡 Port: ${PORT}                                                       ║
-║   🔐 MTN OAuth 2.0: ${MTN_CLIENT_ID && MTN_CLIENT_SECRET ? '✅ Configured' : '❌ MISSING'}       ║
-║   📦 Local Bundles: ✅ Available (MTN, Telecel, AT)                   ║
-║                                                                       ║
-║   📮 Endpoints:                                                       ║
-║      GET /api/bundles?network=mtn       → MTN bundles                ║
-║      GET /api/bundles?network=telecel   → Telecel bundles            ║
-║      GET /api/bundles?network=airteltigo → AT bundles                ║
-║      GET /api/kyc/lookup?phone=024XXXXX → KYC lookup (OAuth 2.0)     ║
-║      POST /deliver                       → Deliver bundle             ║
-║      GET /health                         → Health check               ║
-║                                                                       ║
-║   📝 Test KYC:                                                        ║
-║      curl "http://localhost:${PORT}/api/kyc/lookup?phone=0539477194"    ║
-╚════════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║   🚀 DataFlow Backend Server Running                               ║
+║   📡 Port: ${PORT}                                                   ║
+║   🔐 MTN OAuth2: ${MTN_CLIENT_ID && MTN_CLIENT_SECRET ? '✅ Configured' : '❌ MISSING'}   ║
+║   📦 Local Bundles: ✅ Available                                    ║
+║                                                                   ║
+║   📮 Endpoints:                                                   ║
+║      GET /api/bundles?network=mtn       → MTN bundles            ║
+║      GET /api/bundles?network=telecel   → Telecel bundles        ║
+║      GET /api/bundles?network=airteltigo → AT bundles            ║
+║      GET /api/kyc/lookup?phone=024XXXXX → KYC lookup             ║
+║      POST /deliver                       → Deliver bundle         ║
+║      GET /health                         → Health check           ║
+╚════════════════════════════════════════════════════════════════════╝
   `);
 });
 
