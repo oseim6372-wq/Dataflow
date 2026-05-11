@@ -1,8 +1,7 @@
 // ============================================================
 //  DATEFLOW GH — UNIFIED BACKEND (PRODUCTION READY)
-//  MTN → RemaData API (local format 0XXXXXXXXX + volume mapping)
-//  Telecel/AT → HubNetGH API (local format 0XXXXXXXXX)
-//  Features: Retry logic, bidirectional failover, queue, memory protection
+//  MTN/Telecel/AT → RemaData API (local format 0XXXXXXXXX + volume mapping)
+//  Features: Retry logic, queue, memory protection
 // ============================================================
 
 require("dotenv").config();
@@ -22,9 +21,6 @@ const PORT = process.env.PORT || 3000;
 const REMADATA_API_URL = "https://remadata.com/api";
 const REMADATA_API_KEY = process.env.REMADATA_API_KEY || "";
 
-const HUBNET_BASE_URL = "https://hubnetgh.site/wp-json/hubnet-api/v1";
-const HUBNET_API_KEY = process.env.HUBNET_API_KEY || "";
-
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || "";
 const DELIVER_SECRET = process.env.DELIVER_SECRET || "";
 
@@ -41,28 +37,11 @@ const MAX_REF_SIZE = 10000;
 const failedSaveQueue = [];
 let isProcessingQueue = false;
 
-// Network providers with BIDIRECTIONAL failover for Telecel/AirtelTigo ONLY
-// MTN has NO fallback - RemaData only
+// Network providers - all via RemaData
 const NETWORK_PROVIDER = {
-  mtn: { 
-    name: "RemaData", 
-    primary: true,
-    hasFallback: false  // MTN has no fallback
-  },
-  telecel: { 
-    name: "HubNetGH", 
-    primary: true,
-    hasFallback: true,
-    fallback: "RemaData",
-    fallbackNetwork: "telecel"
-  },
-  airteltigo: { 
-    name: "HubNetGH", 
-    primary: true,
-    hasFallback: true,
-    fallback: "RemaData",
-    fallbackNetwork: "airteltigo"
-  },
+  mtn: { name: "RemaData", primary: true },
+  telecel: { name: "RemaData", primary: true },
+  airteltigo: { name: "RemaData", primary: true },
 };
 
 // Promise cache for profit settings
@@ -149,8 +128,7 @@ async function fetchWithRetry(apiCall, retries = MAX_RETRIES, delay = RETRY_DELA
 
 function validateEnv() {
   const checks = [
-    ["REMADATA_API_KEY", REMADATA_API_KEY, "MTN delivery will fail"],
-    ["HUBNET_API_KEY", HUBNET_API_KEY, "Telecel/AT delivery will fail"],
+    ["REMADATA_API_KEY", REMADATA_API_KEY, "All deliveries will fail"],
     ["PAYSTACK_SECRET_KEY", PAYSTACK_SECRET, "Webhook signature verification disabled"],
     ["DELIVER_SECRET", DELIVER_SECRET, "/deliver endpoint unprotected"],
     ["FIREBASE_DATABASE_URL", process.env.FIREBASE_DATABASE_URL, "Orders will not be saved"],
@@ -427,7 +405,7 @@ function applyProfit(costPrice, volumeInMB, network, settings) {
 //  DELIVERY FUNCTIONS WITH RETRY
 // ─────────────────────────────────────────────
 
-async function deliverViaRemaData(phone, volumeInMB, reference) {
+async function deliverViaRemaData(phone, networkType, volumeInMB, reference) {
   if (!REMADATA_API_KEY) {
     throw new AppError(
       "RemaData API not configured. Please set REMADATA_API_KEY environment variable.",
@@ -438,15 +416,20 @@ async function deliverViaRemaData(phone, volumeInMB, reference) {
   const orderRef = reference || `DF-${Date.now()}`;
   const localPhone = formatPhoneLocal(phone);
   const remaMB = REMA_MB_MAP[Number(volumeInMB)] || Number(volumeInMB);
+  
+  // Map network types to what RemaData expects
+  let remaNetworkType = "mtn";
+  if (networkType === "telecel") remaNetworkType = "telecel";
+  if (networkType === "airteltigo") remaNetworkType = "airteltigo";
 
   const payload = {
     ref: orderRef,
     phone: localPhone,
     volumeInMB: remaMB,
-    networkType: "mtn",
+    networkType: remaNetworkType,
   };
 
-  console.log(`📦 [RemaData] ${volumeInMB}MB → ${remaMB}MB MTN → ${localPhone} | Ref: ${orderRef}`);
+  console.log(`📦 [RemaData] ${volumeInMB}MB → ${remaMB}MB ${networkType} → ${localPhone} | Ref: ${orderRef}`);
 
   const response = await fetchWithRetry(async () => {
     return await axios.post(`${REMADATA_API_URL}/buy-data`, payload, {
@@ -470,66 +453,8 @@ async function deliverViaRemaData(phone, volumeInMB, reference) {
   return { success: true, reference: remaReference, data: response.data, provider: "RemaData" };
 }
 
-// HubNetGH handles all network types (mtn, telecel, airteltigo)
-async function deliverViaHubNet(phone, networkType, volumeInMB, reference) {
-  if (!HUBNET_API_KEY) {
-    throw new AppError(
-      "HubNetGH API not configured. Please set HUBNET_API_KEY environment variable.",
-      503, "CONFIGURATION"
-    );
-  }
-  
-  // Map all network types to HubNetGH expected values
-  let network;
-  switch (networkType) {
-    case "airteltigo":
-      network = "airteltigo";
-      break;
-    case "telecel":
-      network = "telecel";
-      break;
-    case "mtn":
-      network = "mtn";
-      break;
-    default:
-      network = "telecel";
-      console.warn(`⚠️ Unknown network type "${networkType}", defaulting to "telecel"`);
-  }
-  
-  const volume = resolveVolume(volumeInMB);
-  const requestId = reference || `DF-${Date.now()}`;
-  const localPhone = formatPhoneLocal(phone);
-
-  console.log(`📦 [HubNetGH] ${volume}GB ${network} → ${localPhone} | Ref: ${requestId}`);
-
-  const response = await fetchWithRetry(async () => {
-    return await axios.post(
-      `${HUBNET_BASE_URL}/place_order`,
-      { network, volume, customer_number: localPhone, quantity: 1, request_id: requestId },
-      {
-        headers: { "Content-Type": "application/json", "X-API-KEY": HUBNET_API_KEY },
-        timeout: 30000,
-      }
-    );
-  });
-
-  if (!response.data?.success) {
-    const providerMsg = response.data?.message || response.data?.error || "Unknown provider error";
-    throw new AppError(
-      `HubNetGH delivery rejected: ${providerMsg}`,
-      502, "PROVIDER",
-      { providerResponse: response.data }
-    );
-  }
-
-  const orderId = String(response.data?.order_id || requestId);
-  console.log(`✅ [HubNetGH] Delivered | Order ID: ${orderId}`);
-
-  return { success: true, reference: orderId, data: response.data, provider: "HubNetGH" };
-}
-
 // ─────────────────────────────────────────────
-//  DELIVERY ORCHESTRATOR WITH BIDIRECTIONAL FAILOVER (Telecel/AirtelTigo ONLY)
+//  DELIVERY ORCHESTRATOR
 // ─────────────────────────────────────────────
 
 async function deliverData(phone, networkType, volumeInMB, reference = null) {
@@ -543,73 +468,17 @@ async function deliverData(phone, networkType, volumeInMB, reference = null) {
     );
   }
   
-  const primaryProvider = providerConfig.name;
-  
-  // MTN has NO fallback - direct delivery only
-  if (net === "mtn") {
-    try {
-      console.log(`📡 Delivering MTN via ${primaryProvider} (no fallback)`);
-      return await deliverViaRemaData(phone, volumeInMB, reference);
-    } catch (error) {
-      // For MTN, just throw the error directly with customer-friendly message
-      const customerMessage = getCustomerFriendlyMessage(net, error.message);
-      throw new AppError(
-        customerMessage,
-        503,
-        "PROVIDER",
-        { network: net, primaryProvider, error: error.message }
-      );
-    }
-  }
-  
-  // For Telecel and AirtelTigo - bidirectional failover
-  const fallbackProvider = providerConfig.fallback;
-  const fallbackNetwork = providerConfig.fallbackNetwork;
-  
-  const errors = [];
-  
-  // Try primary provider (HubNetGH for Telecel/AirtelTigo)
-  console.log(`📡 Trying primary provider: ${primaryProvider} for ${net}`);
   try {
-    return await deliverViaHubNet(phone, net, volumeInMB, reference);
-  } catch (primaryError) {
-    const errorMsg = `${primaryProvider}: ${primaryError.message}`;
-    errors.push(errorMsg);
-    console.warn(`⚠️ Primary provider ${primaryProvider} failed: ${primaryError.message}`);
-    
-    // Try fallback provider (RemaData)
-    if (fallbackProvider) {
-      console.log(`🔄 Attempting fallback: ${fallbackProvider} for ${net}`);
-      try {
-        let result;
-        if (fallbackProvider === "RemaData") {
-          result = await deliverViaRemaData(phone, volumeInMB, reference);
-        } else {
-          throw new Error(`Unknown fallback provider: ${fallbackProvider}`);
-        }
-        
-        console.log(`✅ Fallback successful! Delivered via ${fallbackProvider} for ${net}`);
-        return result;
-      } catch (fallbackError) {
-        const fallbackErrorMsg = `${fallbackProvider}: ${fallbackError.message}`;
-        errors.push(fallbackErrorMsg);
-        console.error(`❌ Fallback provider ${fallbackProvider} also failed: ${fallbackError.message}`);
-      }
-    }
-    
-    // Both providers failed - throw customer-friendly error
-    const allErrors = errors.join(" | ");
-    const customerMessage = getCustomerFriendlyMessage(net, allErrors);
-    
+    console.log(`📡 Delivering ${net} via RemaData`);
+    return await deliverViaRemaData(phone, net, volumeInMB, reference);
+  } catch (error) {
+    // Throw customer-friendly message
+    const customerMessage = getCustomerFriendlyMessage(net, error.message);
     throw new AppError(
       customerMessage,
       503,
-      "PROVIDER_FAILOVER",
-      { 
-        network: net,
-        attemptedProviders: errors,
-        timestamp: new Date().toISOString()
-      }
+      "PROVIDER",
+      { network: net, provider: "RemaData", error: error.message }
     );
   }
 }
@@ -695,8 +564,7 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   const criticalIssues = [];
-  if (!REMADATA_API_KEY) criticalIssues.push("MTN deliveries will fail");
-  if (!HUBNET_API_KEY) criticalIssues.push("Telecel/AT deliveries will fail");
+  if (!REMADATA_API_KEY) criticalIssues.push("All deliveries will fail");
   if (!DELIVER_SECRET) criticalIssues.push("/deliver endpoint unprotected");
   
   res.json({
@@ -705,14 +573,9 @@ app.get("/health", (req, res) => {
     timestamp: new Date().toISOString(),
     criticalIssues,
     providers: {
-      mtn: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY, hasFallback: false },
-      telecel: { provider: "HubNetGH", configured: !!HUBNET_API_KEY, operational: !!HUBNET_API_KEY, hasFallback: true, fallbackProvider: "RemaData" },
-      airteltigo: { provider: "HubNetGH", configured: !!HUBNET_API_KEY, operational: !!HUBNET_API_KEY, hasFallback: true, fallbackProvider: "RemaData" },
-    },
-    failover: {
-      mtn: "No fallback - RemaData only",
-      telecel: "HubNetGH → RemaData",
-      airteltigo: "HubNetGH → RemaData"
+      mtn: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY },
+      telecel: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY },
+      airteltigo: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY },
     },
     firebase: !!db,
     firebaseQueueSize: failedSaveQueue.length,
@@ -733,25 +596,6 @@ app.get("/api/balance", asyncHandler(async (req, res) => {
     res.json(response.data);
   } catch (err) {
     throw new AppError(`Failed to fetch balance: ${err.message}`, 502, "PROVIDER");
-  }
-}));
-
-app.get("/api/hubnet/balance", asyncHandler(async (req, res) => {
-  if (!HUBNET_API_KEY) {
-    return res.json({ status: "info", balance: null, message: "HubNet API not configured" });
-  }
-  try {
-    const response = await axios.get(`${HUBNET_BASE_URL}/check_balance`, {
-      headers: { "X-API-KEY": HUBNET_API_KEY },
-      timeout: 15000,
-    });
-    if (response.data?.success) {
-      return res.json({ status: "success", balance: response.data.wallet_balance ?? 0 });
-    }
-    res.json({ status: "info", balance: null, message: "Balance unavailable" });
-  } catch (err) {
-    console.warn(`⚠️ HubNet balance check failed: ${err.message}`);
-    res.json({ status: "info", balance: null, message: "Balance unavailable" });
   }
 }));
 
@@ -810,14 +654,12 @@ app.get("/api/bundles", asyncHandler(async (req, res) => {
 
   let bundles = bundleData[network];
 
-  if (network !== "mtn") {
-    const settings = await getProfitSettings();
-    bundles = bundles.map((b) => ({
-      ...b,
-      costPrice: b.price,
-      price: applyProfit(b.price, b.volumeInMB, network, settings),
-    }));
-  }
+  const settings = await getProfitSettings();
+  bundles = bundles.map((b) => ({
+    ...b,
+    costPrice: b.price,
+    price: applyProfit(b.price, b.volumeInMB, network, settings),
+  }));
 
   res.json({ status: "success", data: bundles, count: bundles.length });
 }));
@@ -851,154 +693,45 @@ app.post("/deliver", requireApiKey, asyncHandler(async (req, res) => {
 }));
 
 // ─────────────────────────────────────────────
-//  ORDER STATUS LOOKUP - ENHANCED WITH FIREBASE FIRST
+//  ORDER STATUS LOOKUP
 // ─────────────────────────────────────────────
 
 app.get("/api/order-status/:reference", asyncHandler(async (req, res) => {
   const { reference } = req.params;
-  const { network } = req.query;
 
   if (!reference) {
     throw new AppError("Reference parameter is required", 400, "VALIDATION");
   }
 
-  // STEP 1: Check Firebase first to get the provider reference
-  let knownProvider = null;
-  let providerRef = null;
+  // Check RemaData for status
+  if (!REMADATA_API_KEY) {
+    throw new AppError("RemaData API not configured", 503, "CONFIGURATION");
+  }
+
+  console.log(`🔍 Checking RemaData status for ref: ${reference}`);
   
-  if (db) {
-    try {
-      const snapshot = await db.ref(`transactions/${reference}`).once("value");
-      const order = snapshot.val();
-      if (order && order.provider && order.providerRef) {
-        knownProvider = order.provider;
-        providerRef = order.providerRef;
-        console.log(`📦 Found order in Firebase. Provider: ${knownProvider}, ProviderRef: ${providerRef}`);
-      }
-    } catch (err) {
-      console.warn(`⚠️ Firebase lookup failed: ${err.message}`);
+  try {
+    const response = await axios.get(
+      `${REMADATA_API_URL}/order-status/${encodeURIComponent(reference)}`,
+      { headers: { "X-API-KEY": REMADATA_API_KEY }, timeout: 10000 }
+    );
+    
+    if (response.data?.status === "success") {
+      return res.json({ 
+        status: "success", 
+        provider: "RemaData", 
+        reference: reference,
+        data: response.data.data 
+      });
+    } else {
+      throw new AppError("Order not found", 404, "NOT_FOUND");
     }
-  }
-
-  // STEP 2: Build provider list (prioritize known provider from Firebase)
-  let providersToTry = [];
-  
-  if (knownProvider) {
-    // Use the provider we know from Firebase with the correct providerRef
-    providersToTry = [{ name: knownProvider, ref: providerRef }];
-  } else if (network) {
-    // Use network filter
-    const providerConfig = NETWORK_PROVIDER[network.toLowerCase()];
-    if (providerConfig) {
-      providersToTry = [{ name: providerConfig.name, ref: reference }];
+  } catch (err) {
+    if (err.response?.status === 404 || err.statusCode === 404) {
+      throw new AppError("Order not found", 404, "NOT_FOUND");
     }
-  } else {
-    // Try all providers with the original reference
-    providersToTry = [
-      { name: "RemaData", ref: reference },
-      { name: "HubNetGH", ref: reference }
-    ];
+    throw new AppError(`Failed to check order status: ${err.message}`, 502, "PROVIDER");
   }
-
-  const errors = [];
-
-  for (const provider of providersToTry) {
-    try {
-      const lookupRef = provider.ref || reference;
-      
-      if (provider.name === "RemaData") {
-        if (!REMADATA_API_KEY) { 
-          errors.push("RemaData: API not configured"); 
-          continue; 
-        }
-        console.log(`🔍 Checking RemaData status for ref: ${lookupRef}`);
-        const response = await axios.get(
-          `${REMADATA_API_URL}/order-status/${encodeURIComponent(lookupRef)}`,
-          { headers: { "X-API-KEY": REMADATA_API_KEY }, timeout: 10000 }
-        );
-        if (response.data?.status === "success") {
-          return res.json({ 
-            status: "success", 
-            provider: provider.name, 
-            reference: lookupRef,
-            data: response.data.data 
-          });
-        }
-        errors.push(`RemaData: ${response.data?.message || "not found"}`);
-      } 
-      else if (provider.name === "HubNetGH") {
-        if (!HUBNET_API_KEY) { 
-          errors.push("HubNetGH: API not configured"); 
-          continue; 
-        }
-        console.log(`🔍 Checking HubNetGH status for order_id: ${lookupRef}`);
-        const response = await axios.get(`${HUBNET_BASE_URL}/order_status`, {
-          params: { order_id: lookupRef },
-          headers: { "X-API-KEY": HUBNET_API_KEY },
-          timeout: 10000,
-        });
-        if (response.data?.success) {
-          return res.json({ 
-            status: "success", 
-            provider: provider.name, 
-            reference: lookupRef,
-            data: response.data 
-          });
-        }
-        errors.push(`HubNetGH: ${response.data?.message || "not found"}`);
-      }
-    } catch (err) {
-      errors.push(`${provider.name}: ${err.response?.data?.message || err.message}`);
-    }
-  }
-
-  // Step 3: If not found and we have Firebase data but provider check failed, try alternative
-  if (knownProvider && providerRef && errors.length > 0) {
-    console.log(`🔄 Firebase had provider ${knownProvider} but check failed, trying alternative providers...`);
-    // Try the other provider as fallback
-    const otherProvider = knownProvider === "RemaData" ? "HubNetGH" : "RemaData";
-    try {
-      if (otherProvider === "RemaData" && REMADATA_API_KEY) {
-        const response = await axios.get(
-          `${REMADATA_API_URL}/order-status/${encodeURIComponent(reference)}`,
-          { headers: { "X-API-KEY": REMADATA_API_KEY }, timeout: 10000 }
-        );
-        if (response.data?.status === "success") {
-          return res.json({ 
-            status: "success", 
-            provider: otherProvider, 
-            reference: reference,
-            data: response.data.data,
-            note: "Found via alternative provider" 
-          });
-        }
-      } else if (otherProvider === "HubNetGH" && HUBNET_API_KEY) {
-        const response = await axios.get(`${HUBNET_BASE_URL}/order_status`, {
-          params: { order_id: reference },
-          headers: { "X-API-KEY": HUBNET_API_KEY },
-          timeout: 10000,
-        });
-        if (response.data?.success) {
-          return res.json({ 
-            status: "success", 
-            provider: otherProvider, 
-            reference: reference,
-            data: response.data,
-            note: "Found via alternative provider" 
-          });
-        }
-      }
-    } catch (err) {
-      errors.push(`Alternative ${otherProvider}: ${err.message}`);
-    }
-  }
-
-  console.warn(`⚠️ Order not found for ref "${reference}" | Tried: ${errors.join(" | ")}`);
-  res.status(404).json({
-    status: "error",
-    message: "Order not found",
-    details: errors,
-  });
 }));
 
 app.get("/api/profit-settings", asyncHandler(async (req, res) => {
@@ -1105,20 +838,18 @@ app.listen(PORT, () => {
 ║   🚀  DataFlow GH Backend — Production Ready                 ║
 ║   📡  Port: ${String(PORT).padEnd(37)}║
 ╠══════════════════════════════════════════════════════════════╣
-${col("║  MTN → RemaData (NO FALLBACK)", !!REMADATA_API_KEY)}        ║
-${col("║  Telecel → HubNetGH (failover to RemaData)", !!HUBNET_API_KEY)}        ║
-${col("║  AirtelTigo → HubNetGH (failover to RemaData)", !!HUBNET_API_KEY)}        ║
+${col("║  MTN → RemaData", !!REMADATA_API_KEY)}        ║
+${col("║  Telecel → RemaData", !!REMADATA_API_KEY)}        ║
+${col("║  AirtelTigo → RemaData", !!REMADATA_API_KEY)}        ║
 ${col("║  Paystack Webhook", !!PAYSTACK_SECRET)}        ║
 ${col("║  /deliver Auth", !!DELIVER_SECRET)}        ║
 ${col("║  Firebase", !!db)}        ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Features:                                                  ║
 ║  • Retry logic (${MAX_RETRIES}x exponential backoff)                   ║
-║  • Bidirectional failover (Telecel ↔ RemaData)             ║
-║  • MTN: RemaData only - NO FALLBACK                         ║
+║  • All networks via RemaData                               ║
 ║  • Memory protection (${MAX_REF_SIZE} max refs)                        ║
 ║  • Firebase queue (${failedSaveQueue.length} pending)                    ║
-║  • Enhanced status lookup (Firebase first)                 ║
 ║  • Customer-friendly error messages                        ║
 ╚══════════════════════════════════════════════════════════════╝`);
 });
