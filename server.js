@@ -1,15 +1,9 @@
-// ============================================================
-//  DATEFLOW GH — UNIFIED BACKEND (PRODUCTION READY)
-//  MTN/Telecel/AT → RemaData API (local format 0XXXXXXXXX + volume mapping)
-//  Features: Retry logic, queue, memory protection
-// ============================================================
+require('dotenv').config();
 
-require("dotenv").config();
-const express = require("express");
-const axios = require("axios");
-const cors = require("cors");
-const admin = require("firebase-admin");
-const crypto = require("crypto");
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,295 +11,38 @@ const PORT = process.env.PORT || 3000;
 // ─────────────────────────────────────────────
 //  CONFIGURATION
 // ─────────────────────────────────────────────
+const REMADATA_API_URL = 'https://remadata.com/api';
+const REMADATA_API_KEY  = process.env.REMADATA_API_KEY  || '';
+const PAYSTACK_SECRET   = process.env.PAYSTACK_SECRET   || '';
+const SELF_URL          = process.env.SELF_URL          || `http://localhost:${PORT}`;
+const DELIVER_SECRET    = process.env.DELIVER_SECRET    || '';
 
-const REMADATA_API_URL = "https://remadata.com/api";
-const REMADATA_API_KEY = process.env.REMADATA_API_KEY || "";
+// MTN KYC API Configuration - OAuth2
+const MTN_API_URL = 'https://api.mtn.com/v1/customers';
+const MTN_TOKEN_URL = 'https://api.mtn.com/oauth/client_credential/accesstoken';
+const MTN_CLIENT_ID = process.env.MTN_CLIENT_ID || '';      // Your API key / client ID
+const MTN_CLIENT_SECRET = process.env.MTN_CLIENT_SECRET || ''; // The customer secret they gave you
+const MTN_API_KEY = process.env.MTN_API_KEY || ''; // Optional: x-api-key if still needed
 
-const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || "";
-const DELIVER_SECRET = process.env.DELIVER_SECRET || "";
+// Token cache
+let mtnAccessToken = null;
+let tokenExpiresAt = null;
 
-// Retry configuration
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 1000;
-
-// Processed references with memory protection
-const processedRefs = new Map();
-const REF_TTL = 24 * 60 * 60 * 1000;
-const MAX_REF_SIZE = 10000;
-
-// Firebase failed saves queue
-const failedSaveQueue = [];
-let isProcessingQueue = false;
-
-// Network providers - all via RemaData
-const NETWORK_PROVIDER = {
-  mtn: { name: "RemaData", primary: true },
-  telecel: { name: "RemaData", primary: true },
-  airteltigo: { name: "RemaData", primary: true },
-};
-
-// Promise cache for profit settings
-let profitSettingsPromise = null;
-let profitSettingsCache = null;
-let lastCacheUpdate = 0;
-const CACHE_TTL = 5 * 60 * 1000;
-
-// ─────────────────────────────────────────────
-//  VOLUME MAPPING FOR REMADATA
-// ─────────────────────────────────────────────
-
-const REMA_MB_MAP = {
-  1024: 1000, 2048: 2000, 3072: 3000, 4096: 4000,
-  5120: 5000, 6144: 6000, 7168: 7000, 8192: 8000,
-  9216: 9000, 10240: 10000, 11264: 11000, 12288: 12000,
-  13312: 13000, 14336: 14000, 15360: 15000, 16384: 16000,
-  17408: 17000, 18432: 18000, 19456: 19000, 20480: 20000,
-  25600: 25000, 30720: 30000, 40960: 40000, 51200: 50000,
-  102400: 100000
-};
-
-// ─────────────────────────────────────────────
-//  STRUCTURED ERROR CLASS
-// ─────────────────────────────────────────────
-
-class AppError extends Error {
-  constructor(message, statusCode = 500, category = "INTERNAL", details = null) {
-    super(message);
-    this.statusCode = statusCode;
-    this.category = category;
-    this.details = details;
-    this.isOperational = true;
-  }
-}
-
-function asyncHandler(fn) {
-  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-}
-
-// ─────────────────────────────────────────────
-//  CUSTOMER-FRIENDLY ERROR MESSAGES
-// ─────────────────────────────────────────────
-
-function getCustomerFriendlyMessage(network, technicalDetails) {
-  const messages = {
-    mtn: "MTN data delivery is temporarily unavailable. Please try again in a few minutes. If the issue persists, contact support.",
-    telecel: "Telecel data delivery is temporarily unavailable. Please try again in a few minutes. If the issue persists, contact support.",
-    airteltigo: "AirtelTigo data delivery is temporarily unavailable. Please try again in a few minutes. If the issue persists, contact support."
-  };
-  
-  const baseMessage = messages[network] || "Data delivery is temporarily unavailable. Please try again later.";
-  
-  // Log technical details for admin only
-  console.error(`📝 Technical details for ${network}: ${technicalDetails}`);
-  
-  return baseMessage;
-}
-
-// ─────────────────────────────────────────────
-//  RETRY LOGIC WITH EXPONENTIAL BACKOFF
-// ─────────────────────────────────────────────
-
-async function fetchWithRetry(apiCall, retries = MAX_RETRIES, delay = RETRY_DELAY_MS) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      return await apiCall();
-    } catch (err) {
-      const isLastAttempt = i === retries - 1;
-      const isProviderError = err.category === "PROVIDER";
-      
-      if (isLastAttempt || !isProviderError) throw err;
-      
-      const waitTime = delay * Math.pow(2, i);
-      console.log(`🔄 Retry ${i + 1}/${retries} after ${waitTime}ms: ${err.message}`);
-      await new Promise(resolve => setTimeout(resolve, waitTime));
-    }
-  }
-}
-
-// ─────────────────────────────────────────────
-//  STARTUP VALIDATION
-// ─────────────────────────────────────────────
-
-function validateEnv() {
-  const checks = [
-    ["REMADATA_API_KEY", REMADATA_API_KEY, "All deliveries will fail"],
-    ["PAYSTACK_SECRET_KEY", PAYSTACK_SECRET, "Webhook signature verification disabled"],
-    ["DELIVER_SECRET", DELIVER_SECRET, "/deliver endpoint unprotected"],
-    ["FIREBASE_DATABASE_URL", process.env.FIREBASE_DATABASE_URL, "Orders will not be saved"],
-    ["FIREBASE_SERVICE_ACCOUNT_JSON", process.env.FIREBASE_SERVICE_ACCOUNT_JSON, "Firebase disabled"],
-  ];
-
-  const missing = checks.filter(([, val]) => !val);
-  if (missing.length) {
-    console.warn("⚠️  Missing environment variables:");
-    missing.forEach(([key, , impact]) =>
-      console.warn(`   • ${key.padEnd(36)} → ${impact}`)
-    );
-  }
-}
-
-// ─────────────────────────────────────────────
-//  FIREBASE ADMIN INIT
-// ─────────────────────────────────────────────
-let db = null;
-
-try {
-  const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-    ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
-    : null;
-
-  if (serviceAccount && process.env.FIREBASE_DATABASE_URL) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      databaseURL: process.env.FIREBASE_DATABASE_URL,
-    });
-    db = admin.database();
-    console.log("✅ Firebase Admin initialised");
-    
-    // Start queue processor
-    setInterval(processFailedSaveQueue, 60000);
-  } else {
-    if (!serviceAccount) console.warn("⚠️  FIREBASE_SERVICE_ACCOUNT_JSON not set — Firebase disabled");
-    if (!process.env.FIREBASE_DATABASE_URL) console.warn("⚠️  FIREBASE_DATABASE_URL not set — Firebase disabled");
-  }
-} catch (err) {
-  console.error(`❌ Firebase init failed: ${err.message}`);
-}
-
-// ─────────────────────────────────────────────
-//  FIREBASE QUEUE PROCESSOR
-// ─────────────────────────────────────────────
-
-async function saveOrderWithRetry(ref, payload, retries = 5) {
-  if (!db) {
-    failedSaveQueue.push({ ref, payload, timestamp: Date.now() });
-    console.warn(`⚠️ Firebase unavailable, queued order "${ref}" (queue size: ${failedSaveQueue.length})`);
-    return;
-  }
-  
-  for (let i = 0; i < retries; i++) {
-    try {
-      await db.ref(`transactions/${ref}`).set(payload);
-      console.log(`✅ Order "${ref}" saved to Firebase`);
-      return;
-    } catch (err) {
-      if (i === retries - 1) {
-        failedSaveQueue.push({ ref, payload, timestamp: Date.now() });
-        console.error(`❌ Failed to save order "${ref}" after ${retries} retries, queued`);
-      } else {
-        await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
-      }
-    }
-  }
-}
-
-async function saveFailedOrderWithRetry(ref, payload, errMessage) {
-  const failedPayload = {
-    ...payload,
-    status: "failed",
-    error: errMessage,
-    timestamp: new Date().toISOString(),
-  };
-  await saveOrderWithRetry(ref, failedPayload);
-}
-
-async function processFailedSaveQueue() {
-  if (isProcessingQueue || !db || failedSaveQueue.length === 0) return;
-  
-  isProcessingQueue = true;
-  console.log(`🔄 Processing ${failedSaveQueue.length} queued Firebase saves...`);
-  
-  const queueCopy = [...failedSaveQueue];
-  failedSaveQueue.length = 0;
-  
-  for (const item of queueCopy) {
-    try {
-      await db.ref(`transactions/${item.ref}`).set(item.payload);
-      console.log(`✅ Queued order "${item.ref}" saved after recovery`);
-    } catch (err) {
-      console.error(`❌ Still failed to save "${item.ref}" after recovery, re-queuing`);
-      failedSaveQueue.push(item);
-    }
-  }
-  
-  isProcessingQueue = false;
-  
-  if (failedSaveQueue.length > 0) {
-    setTimeout(processFailedSaveQueue, 30000);
-  }
-}
-
-// ─────────────────────────────────────────────
-//  PROCESSED REFS CLEANUP (Memory Protection)
-// ─────────────────────────────────────────────
-
-setInterval(() => {
-  const now = Date.now();
-  let deletedCount = 0;
-  
-  for (const [ref, timestamp] of processedRefs.entries()) {
-    if (now - timestamp > REF_TTL) {
-      processedRefs.delete(ref);
-      deletedCount++;
-    }
-  }
-  
-  // Force cleanup if size exceeds limit
-  if (processedRefs.size > MAX_REF_SIZE) {
-    const excess = processedRefs.size - MAX_REF_SIZE;
-    const iterator = processedRefs.keys();
-    for (let i = 0; i < excess; i++) {
-      processedRefs.delete(iterator.next().value);
-    }
-    console.warn(`⚠️ Force-cleaned ${excess} old refs, size now ${processedRefs.size}`);
-  }
-  
-  if (deletedCount > 0) {
-    console.log(`🧹 Cleaned ${deletedCount} expired refs, size: ${processedRefs.size}`);
-  }
-}, 60 * 60 * 1000);
+// In-memory dedup set (resets on server restart)
+const processedRefs = new Set();
 
 // ─────────────────────────────────────────────
 //  MIDDLEWARE
 // ─────────────────────────────────────────────
+app.post('/paystack-webhook', express.raw({ type: 'application/json' }), handlePaystackWebhook);
+app.post('/webhook/paystack', express.raw({ type: 'application/json' }), handlePaystackWebhook);
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'] }));
 
-app.use(cors({ origin: "*" }));
-
-// Raw body capture for Paystack webhook
+// Request logging
 app.use((req, res, next) => {
-  if (req.path === "/paystack/webhook") {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => {
-      req.rawBody = Buffer.concat(chunks);
-      try {
-        req.body = JSON.parse(req.rawBody.toString());
-      } catch {
-        req.body = {};
-      }
-      next();
-    });
-    req.on("error", next);
-  } else {
-    express.json()(req, res, next);
-  }
-});
-
-// Request timeout
-app.use((req, res, next) => {
-  req.setTimeout(30000);
-  res.setTimeout(30000);
-  next();
-});
-
-// Request logger
-app.use((req, res, next) => {
-  const start = Date.now();
-  res.on("finish", () => {
-    const ms = Date.now() - start;
-    const icon = res.statusCode < 400 ? "✓" : res.statusCode < 500 ? "⚠" : "✗";
-    console.log(`${icon} ${req.method} ${req.path} → ${res.statusCode} (${ms}ms)`);
-  });
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
   next();
 });
 
@@ -315,554 +52,704 @@ app.use((req, res, next) => {
 
 function requireApiKey(req, res, next) {
   if (!DELIVER_SECRET) {
-    return next(new AppError("DELIVER_SECRET not configured", 500, "INTERNAL"));
+    console.warn('⚠️ DELIVER_SECRET not configured — /deliver is unprotected!');
+    return res.status(500).json({ status: 'error', message: 'Server misconfiguration: DELIVER_SECRET not set' });
   }
-  const key = req.headers["x-api-key"] || req.body?.apiKey;
+  const key = req.headers['x-api-key'] || req.body?.apiKey;
   if (!key || key !== DELIVER_SECRET) {
-    console.warn(`🚫 Unauthorized /deliver attempt — IP: ${req.ip}`);
-    return next(new AppError("Invalid or missing API key", 401, "AUTH"));
+    console.warn(`🚫 Unauthorized /deliver attempt from ${req.ip}`);
+    return res.status(401).json({ status: 'error', message: 'Unauthorized' });
   }
   next();
 }
 
 // ─────────────────────────────────────────────
-//  PHONE FORMATTING HELPERS
+//  MTN OAUTH2 TOKEN MANAGEMENT
 // ─────────────────────────────────────────────
 
-function formatPhoneLocal(phone) {
-  let p = String(phone).replace(/[\s\-]/g, "");
-  
-  if (p.startsWith("233")) p = "0" + p.slice(3);
-  if (p.startsWith("+233")) p = "0" + p.slice(4);
-  if (!p.startsWith("0")) p = "0" + p;
-  
-  if (!/^0\d{9}$/.test(p)) {
-    throw new AppError(
-      `Phone must be 10 digits starting with 0 (e.g., 0551234567), got: "${phone}"`,
-      400, "VALIDATION"
+/**
+ * Get OAuth2 access token from MTN
+ * Uses client credentials flow (application scope)
+ */
+async function getMtnAccessToken() {
+  // Check if we have a valid cached token (with 5 min buffer)
+  if (mtnAccessToken && tokenExpiresAt && Date.now() < tokenExpiresAt - 5 * 60 * 1000) {
+    console.log('✅ Using cached MTN access token');
+    return mtnAccessToken;
+  }
+
+  if (!MTN_CLIENT_ID || !MTN_CLIENT_SECRET) {
+    throw new Error('MTN_CLIENT_ID and MTN_CLIENT_SECRET environment variables are required');
+  }
+
+  console.log('🔄 Fetching new MTN OAuth2 token...');
+
+  try {
+    // Create Basic Auth header
+    const credentials = Buffer.from(`${MTN_CLIENT_ID}:${MTN_CLIENT_SECRET}`).toString('base64');
+
+    const response = await axios.post(
+      MTN_TOKEN_URL,
+      'grant_type=client_credentials',
+      {
+        headers: {
+          'Authorization': `Basic ${credentials}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        timeout: 15000
+      }
     );
-  }
-  return p;
-}
 
-function resolveVolume(volumeInMB) {
-  const mb = Number(volumeInMB);
-  return mb >= 1024 ? String(Math.round(mb / 1024)) : String(mb);
-}
+    const { access_token, expires_in } = response.data;
 
-// ─────────────────────────────────────────────
-//  PROFIT SETTINGS
-// ─────────────────────────────────────────────
-
-async function getProfitSettings() {
-  if (profitSettingsCache && (Date.now() - lastCacheUpdate) < CACHE_TTL) {
-    return profitSettingsCache;
-  }
-
-  if (profitSettingsPromise) return profitSettingsPromise;
-
-  profitSettingsPromise = (async () => {
-    if (!db) {
-      const defaultSettings = { mode: "flat", flatAmount: 0 };
-      profitSettingsCache = defaultSettings;
-      lastCacheUpdate = Date.now();
-      return defaultSettings;
+    if (!access_token) {
+      throw new Error('No access token received from MTN');
     }
-    try {
-      const snap = await db.ref("system/profitSettings").once("value");
-      profitSettingsCache = snap.val() || { mode: "flat", flatAmount: 0 };
-      lastCacheUpdate = Date.now();
-      return profitSettingsCache;
-    } catch (err) {
-      console.warn(`⚠️ Could not load profit settings: ${err.message}`);
-      return { mode: "flat", flatAmount: 0 };
-    } finally {
-      profitSettingsPromise = null;
+
+    // Cache the token (expires_in is in seconds)
+    mtnAccessToken = access_token;
+    tokenExpiresAt = Date.now() + (expires_in * 1000);
+
+    console.log(`✅ MTN OAuth2 token obtained. Expires in ${expires_in} seconds`);
+    return mtnAccessToken;
+
+  } catch (error) {
+    console.error('❌ Failed to get MTN OAuth2 token:', error.response?.data || error.message);
+    throw new Error(`MTN authentication failed: ${error.response?.data?.error_description || error.message}`);
+  }
+}
+
+/**
+ * Make an authenticated request to MTN API
+ * Automatically handles token refresh
+ */
+async function mtnApiRequest(endpoint, options = {}) {
+  const token = await getMtnAccessToken();
+  
+  const headers = {
+    'Authorization': `Bearer ${token}`,
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+    ...options.headers
+  };
+  
+  // Add x-api-key if provided (hybrid auth)
+  if (MTN_API_KEY) {
+    headers['x-api-key'] = MTN_API_KEY;
+  }
+
+  try {
+    const response = await axios({
+      method: options.method || 'GET',
+      url: `${MTN_API_URL}${endpoint}`,
+      headers,
+      data: options.data,
+      timeout: options.timeout || 15000
+    });
+    return response;
+  } catch (error) {
+    // If token expired, clear cache and retry once
+    if (error.response?.status === 401) {
+      console.log('⚠️ Token may have expired, clearing cache and retrying...');
+      mtnAccessToken = null;
+      tokenExpiresAt = null;
+      
+      const newToken = await getMtnAccessToken();
+      const retryHeaders = {
+        'Authorization': `Bearer ${newToken}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        ...options.headers
+      };
+      if (MTN_API_KEY) retryHeaders['x-api-key'] = MTN_API_KEY;
+      
+      const retryResponse = await axios({
+        method: options.method || 'GET',
+        url: `${MTN_API_URL}${endpoint}`,
+        headers: retryHeaders,
+        data: options.data,
+        timeout: options.timeout || 15000
+      });
+      return retryResponse;
     }
-  })();
-
-  return profitSettingsPromise;
-}
-
-function applyProfit(costPrice, volumeInMB, network, settings) {
-  if (!settings) return costPrice;
-  const { mode, flatAmount = 0, percentAmount = 0, perBundle = {} } = settings;
-  
-  if (mode === "percent") {
-    const pct = parseFloat(percentAmount) || 0;
-    return Math.ceil(costPrice * (1 + pct / 100) * 20) / 20;
+    throw error;
   }
-  if (mode === "perBundle") {
-    const key = `${network}_${volumeInMB}`;
-    const bundleProfit = parseFloat(perBundle?.[key]) || parseFloat(flatAmount) || 0;
-    return Math.ceil((costPrice + bundleProfit) * 20) / 20;
-  }
-  const flat = parseFloat(flatAmount) || 0;
-  return Math.ceil((costPrice + flat) * 20) / 20;
 }
 
 // ─────────────────────────────────────────────
-//  DELIVERY FUNCTIONS WITH RETRY
+//  MTN KYC HELPER FUNCTIONS
 // ─────────────────────────────────────────────
 
-async function deliverViaRemaData(phone, networkType, volumeInMB, reference) {
-  if (!REMADATA_API_KEY) {
-    throw new AppError(
-      "RemaData API not configured. Please set REMADATA_API_KEY environment variable.",
-      503, "CONFIGURATION"
-    );
+/**
+ * Format phone number to E.123 standard for MTN API
+ * Converts: 024XXXXXXX → 23324XXXXXXX
+ */
+function formatPhoneForMtn(phone) {
+  let formatted = phone.replace(/\s+/g, '').replace(/-/g, '');
+  
+  if (formatted.startsWith('0')) {
+    formatted = '233' + formatted.substring(1);
+  }
+  if (formatted.startsWith('+')) {
+    formatted = formatted.substring(1);
   }
   
+  return formatted;
+}
+
+/**
+ * Validate MTN phone number
+ * MTN Ghana prefixes: 024, 054, 055, 059, 053
+ */
+function isValidMtnNumber(phone) {
+  const cleanPhone = phone.replace(/\s+/g, '').replace(/-/g, '');
+  const mtnPrefixes = ['024', '054', '055', '059', '053'];
+  const prefix = cleanPhone.substring(0, 3);
+  
+  if (cleanPhone.startsWith('0') && mtnPrefixes.includes(prefix)) {
+    return true;
+  }
+  
+  if (cleanPhone.startsWith('233')) {
+    const localPrefix = cleanPhone.substring(3, 6);
+    return mtnPrefixes.includes(localPrefix);
+  }
+  
+  return false;
+}
+
+/**
+ * Fetch KYC details from MTN API using OAuth2
+ */
+async function fetchMtnKyc(phoneNumber) {
+  const formattedPhone = formatPhoneForMtn(phoneNumber);
+  const transactionId = `DF-KYC-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+  
+  console.log(`🔍 Looking up KYC for: ${phoneNumber} → ${formattedPhone}`);
+  console.log(`📝 Transaction ID: ${transactionId}`);
+  
+  try {
+    const response = await mtnApiRequest(`/${formattedPhone}/kyc`, {
+      method: 'GET',
+      headers: {
+        'transactionId': transactionId
+      },
+      timeout: 15000
+    });
+    
+    console.log(`✅ KYC lookup successful for: ${phoneNumber}`);
+    return {
+      success: true,
+      data: response.data
+    };
+  } catch (error) {
+    console.error(`❌ KYC lookup failed for ${phoneNumber}:`, error.response?.status, error.response?.data || error.message);
+    
+    if (error.response?.status === 404) {
+      return {
+        success: false,
+        error: 'Customer not found in MTN records',
+        statusCode: 404
+      };
+    } else if (error.response?.status === 401 || error.response?.status === 403) {
+      return {
+        success: false,
+        error: 'API authentication failed. Please check MTN credentials.',
+        statusCode: error.response.status
+      };
+    } else {
+      return {
+        success: false,
+        error: error.response?.data?.message || 'Failed to fetch customer KYC data',
+        statusCode: error.response?.status || 500
+      };
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+//  HELPER FUNCTIONS
+// ─────────────────────────────────────────────
+
+async function deliverData(phone, volumeInMB, networkType, reference = null) {
   const orderRef = reference || `DF-${Date.now()}`;
-  const localPhone = formatPhoneLocal(phone);
-  const remaMB = REMA_MB_MAP[Number(volumeInMB)] || Number(volumeInMB);
-  
-  // Map network types to what RemaData expects
-  let remaNetworkType = "mtn";
-  if (networkType === "telecel") remaNetworkType = "telecel";
-  if (networkType === "airteltigo") remaNetworkType = "airteltigo";
+
+  let formattedPhone = phone.replace(/\s+/g, '').replace(/-/g, '');
+  if (formattedPhone.startsWith('0')) {
+    formattedPhone = '233' + formattedPhone.substring(1);
+  }
+  if (formattedPhone.startsWith('+')) {
+    formattedPhone = formattedPhone.substring(1);
+  }
 
   const payload = {
-    ref: orderRef,
-    phone: localPhone,
-    volumeInMB: remaMB,
-    networkType: remaNetworkType,
+    ref:         orderRef,
+    phone:       formattedPhone,
+    volumeInMB:  Number(volumeInMB),
+    networkType: networkType.toLowerCase()
   };
 
-  console.log(`📦 [RemaData] ${volumeInMB}MB → ${remaMB}MB ${networkType} → ${localPhone} | Ref: ${orderRef}`);
+  console.log(`📦 Delivering ${volumeInMB}MB (${networkType}) → ${phone} | Ref: ${orderRef}`);
 
-  const response = await fetchWithRetry(async () => {
-    return await axios.post(`${REMADATA_API_URL}/buy-data`, payload, {
-      headers: { "X-API-KEY": REMADATA_API_KEY, "Content-Type": "application/json" },
-      timeout: 30000,
-    });
-  });
-
-  if (response.data?.status !== "success") {
-    const providerMsg = response.data?.message || response.data?.error || "Unknown provider error";
-    throw new AppError(
-      `RemaData delivery rejected: ${providerMsg}`,
-      502, "PROVIDER",
-      { providerResponse: response.data }
-    );
-  }
-
-  const remaReference = response.data?.data?.reference || response.data?.reference || orderRef;
-  console.log(`✅ [RemaData] Delivered | Provider ref: ${remaReference}`);
-
-  return { success: true, reference: remaReference, data: response.data, provider: "RemaData" };
-}
-
-// ─────────────────────────────────────────────
-//  DELIVERY ORCHESTRATOR
-// ─────────────────────────────────────────────
-
-async function deliverData(phone, networkType, volumeInMB, reference = null) {
-  const net = networkType?.toLowerCase();
-  const providerConfig = NETWORK_PROVIDER[net];
-  
-  if (!providerConfig) {
-    throw new AppError(
-      `Unsupported network: "${networkType}". Valid: ${Object.keys(NETWORK_PROVIDER).join(", ")}`,
-      400, "VALIDATION"
-    );
-  }
-  
   try {
-    console.log(`📡 Delivering ${net} via RemaData`);
-    return await deliverViaRemaData(phone, net, volumeInMB, reference);
-  } catch (error) {
-    // Throw customer-friendly message
-    const customerMessage = getCustomerFriendlyMessage(net, error.message);
-    throw new AppError(
-      customerMessage,
-      503,
-      "PROVIDER",
-      { network: net, provider: "RemaData", error: error.message }
+    const response = await axios.post(
+      `${REMADATA_API_URL}/buy-data`,
+      payload,
+      {
+        headers: {
+          'X-API-KEY':    REMADATA_API_KEY,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
     );
+    console.log(`✅ Delivery success:`, response.data);
+
+    const remaReference = response.data?.data?.reference || response.data?.reference || orderRef;
+
+    return {
+      success: true,
+      data: response.data,
+      remaDataRef: remaReference
+    };
+  } catch (error) {
+    console.error(`❌ Delivery failed:`, error.response?.data || error.message);
+
+    const enhancedError = new Error(
+      error.response?.data?.message ||
+      error.response?.data?.error ||
+      error.message ||
+      'Delivery failed'
+    );
+    enhancedError.status = error.response?.status || 500;
+    enhancedError.details = error.response?.data || null;
+    enhancedError.code = error.code;
+
+    throw enhancedError;
   }
 }
 
-// ─────────────────────────────────────────────
-//  WEBHOOK HANDLER
-// ─────────────────────────────────────────────
+async function handlePaystackWebhook(req, res) {
+  console.log(`📨 Webhook received at ${req.path}`);
 
-function verifyPaystackSignature(rawBody, signature) {
-  if (!PAYSTACK_SECRET || !rawBody || !signature) return false;
-  const hash = crypto.createHmac("sha512", PAYSTACK_SECRET).update(rawBody).digest("hex");
-  return hash === signature;
-}
-
-app.post("/paystack/webhook", async (req, res) => {
-  const signature = req.headers["x-paystack-signature"];
-
-  if (!verifyPaystackSignature(req.rawBody, signature)) {
-    console.warn("⚠️ Paystack webhook: invalid signature");
-    return res.status(401).json({ error: "Invalid signature" });
+  if (!PAYSTACK_SECRET) {
+    console.warn('⚠️ No Paystack secret configured — rejecting webhook');
+    return res.status(401).send('Unauthorized');
   }
 
-  const event = req.body;
-  if (!event?.event) {
-    console.error("❌ Webhook: empty or malformed body");
-    return res.status(400).json({ error: "Invalid body" });
+  const hash = crypto
+    .createHmac('sha512', PAYSTACK_SECRET)
+    .update(req.body)
+    .digest('hex');
+
+  if (hash !== req.headers['x-paystack-signature']) {
+    console.warn('⚠️ Paystack webhook: invalid signature — rejected');
+    return res.status(401).send('Unauthorized');
   }
 
-  console.log(`📨 Webhook: ${event.event}`);
-  res.status(200).json({ received: true });
+  let event;
+  try {
+    event = JSON.parse(req.body.toString());
+  } catch (err) {
+    console.error('❌ Failed to parse webhook JSON:', err);
+    return res.status(400).send('Bad JSON');
+  }
 
-  if (event.event !== "charge.success") return;
+  res.sendStatus(200);
 
-  const { data } = event;
-  const meta = data.metadata || {};
-  const phone = meta.phone || meta.customer_phone;
-  const networkType = meta.networkType || meta.network_type;
-  const volumeInMB = meta.volumeInMB || meta.volume_in_mb;
-  const ref = data.reference;
-  const amount = data.amount ? data.amount / 100 : 0;
+  if (event.event !== 'charge.success') {
+    console.log(`📝 Webhook event ignored: ${event.event}`);
+    return;
+  }
 
-  const baseOrderData = { ref, phone, networkType, volumeInMB, amount, source: "paystack_webhook" };
+  const { reference, metadata, amount } = event.data;
+
+  if (processedRefs.has(reference)) {
+    console.warn(`⚠️ Duplicate webhook ignored for ref: ${reference}`);
+    return;
+  }
+
+  let txData;
+  try {
+    console.log(`🔍 Verifying transaction with Paystack API...`);
+    const verifyRes = await axios.get(
+      `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
+      {
+        headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` },
+        timeout: 15000,
+      }
+    );
+
+    txData = verifyRes.data?.data;
+
+    if (!txData || txData.status !== 'success') {
+      console.warn(`⚠️ Paystack API verification failed for ${reference}: status=${txData?.status}`);
+      return;
+    }
+
+    if (process.env.NODE_ENV === 'production' && txData.domain === 'test') {
+      console.warn(`⚠️ Test-mode transaction rejected in production: ${reference}`);
+      return;
+    }
+
+    if (txData.amount !== amount) {
+      console.error(`🚨 AMOUNT MISMATCH - FAKE TRANSACTION DETECTED!`);
+      return;
+    }
+
+    console.log(`✅ Transaction verified: ${reference} | Amount: ${(txData.amount / 100).toFixed(2)} GHS`);
+
+  } catch (err) {
+    console.error(`❌ Paystack API verification error:`, err.message);
+    return;
+  }
+
+  processedRefs.add(reference);
+
+  const phone = metadata?.phone;
+  const volumeInMB = metadata?.volumeInMB;
+  const networkType = metadata?.networkType;
+
+  console.log(`💰 Payment received: ${reference}`);
 
   if (!phone || !volumeInMB || !networkType) {
-    console.warn(`⚠️ Webhook: missing metadata — phone=${phone}, volume=${volumeInMB}, network=${networkType}`);
+    console.error(`❌ Webhook missing delivery metadata for ref: ${reference}`);
+    processedRefs.delete(reference);
     return;
   }
-
-  if (processedRefs.has(ref)) {
-    console.warn(`⚠️ Webhook: duplicate ref ignored — ${ref}`);
-    return;
-  }
-  processedRefs.set(ref, Date.now());
-
-  console.log(`💳 Webhook auto-delivery: ${networkType} ${volumeInMB}MB → ${phone}`);
 
   try {
-    const result = await deliverData(phone, networkType, Number(volumeInMB), ref);
-
-    await saveOrderWithRetry(ref, {
-      ...baseOrderData,
-      status: "completed",
-      provider: result.provider,
-      providerRef: result.reference,
-      timestamp: new Date().toISOString(),
-    });
-
-    console.log(`✅ Webhook delivery complete | Provider: ${result.provider}`);
+    console.log(`🚀 Auto-delivering after verified payment: ${reference}`);
+    const result = await deliverData(phone, Number(volumeInMB), networkType, reference);
+    console.log(`🎉 Auto-delivery successful! RemaData Ref: ${result.remaDataRef}`);
   } catch (err) {
-    console.error(`❌ Webhook delivery failed: ${err.message}`);
-    await saveFailedOrderWithRetry(ref, baseOrderData, err.message);
-    processedRefs.delete(ref);
+    console.error(`❌ Auto-delivery failed for ${reference}:`, err.message);
+    processedRefs.delete(reference);
   }
-});
+}
 
 // ─────────────────────────────────────────────
-//  API ROUTES
+//  ROUTES
 // ─────────────────────────────────────────────
 
-app.get("/", (req, res) => {
-  res.json({ status: "online", service: "DataFlow GH", timestamp: new Date().toISOString() });
-});
-
-app.get("/health", (req, res) => {
-  const criticalIssues = [];
-  if (!REMADATA_API_KEY) criticalIssues.push("All deliveries will fail");
-  if (!DELIVER_SECRET) criticalIssues.push("/deliver endpoint unprotected");
-  
+// Health check
+app.get('/health', (req, res) => {
   res.json({
-    status: criticalIssues.length > 0 ? "DEGRADED" : "OK",
-    service: "DataFlow GH",
+    status: 'OK',
     timestamp: new Date().toISOString(),
-    criticalIssues,
-    providers: {
-      mtn: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY },
-      telecel: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY },
-      airteltigo: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY },
-    },
-    firebase: !!db,
-    firebaseQueueSize: failedSaveQueue.length,
-    webhook: !!PAYSTACK_SECRET,
-    memory: { processedRefsSize: processedRefs.size },
+    remadataConfigured: !!REMADATA_API_KEY && REMADATA_API_KEY !== '',
+    paystackConfigured: !!PAYSTACK_SECRET && PAYSTACK_SECRET !== '',
+    deliverProtected:   !!DELIVER_SECRET  && DELIVER_SECRET  !== '',
+    mtnKycConfigured:   !!(MTN_CLIENT_ID && MTN_CLIENT_SECRET),
+    endpoints: ['/deliver', '/api/balance', '/api/order-status/:ref', '/paystack-webhook', '/api/bundles', '/api/orders', '/api/kyc/lookup']
   });
 });
 
-app.get("/api/balance", asyncHandler(async (req, res) => {
-  if (!REMADATA_API_KEY) {
-    throw new AppError("RemaData API not configured", 503, "CONFIGURATION");
-  }
+// Wallet balance
+app.get('/api/balance', async (req, res) => {
   try {
     const response = await axios.get(`${REMADATA_API_URL}/wallet-balance`, {
-      headers: { "X-API-KEY": REMADATA_API_KEY },
-      timeout: 10000,
+      headers: { 'X-API-KEY': REMADATA_API_KEY },
+      timeout: 10000
     });
     res.json(response.data);
   } catch (err) {
-    throw new AppError(`Failed to fetch balance: ${err.message}`, 502, "PROVIDER");
+    console.error('Balance error:', err.response?.data || err.message);
+    res.status(500).json({ status: 'error', message: err.response?.data?.message || 'Failed to fetch balance' });
   }
-}));
+});
 
-app.get("/api/bundles", asyncHandler(async (req, res) => {
-  const network = (req.query.network || "mtn").toLowerCase();
+// Available bundles
+app.get('/api/bundles', async (req, res) => {
+  const { network } = req.query;
+  try {
+    let url = `${REMADATA_API_URL}/bundles`;
+    if (network) url += `?network=${network}`;
+    const response = await axios.get(url, {
+      headers: { 'X-API-KEY': REMADATA_API_KEY },
+      timeout: 10000
+    });
+    res.json(response.data);
+  } catch (err) {
+    console.error('Bundles error:', err.response?.data || err.message);
+    res.status(500).json({ status: 'error', message: 'Failed to fetch bundles' });
+  }
+});
 
-  const bundleData = {
-    mtn: [
-      { volumeInMB: 1024, volume: "1GB", price: 4.30, name: "1GB", network: "mtn" },
-      { volumeInMB: 2048, volume: "2GB", price: 8.60, name: "2GB", network: "mtn" },
-      { volumeInMB: 3072, volume: "3GB", price: 12.50, name: "3GB", network: "mtn" },
-      { volumeInMB: 4096, volume: "4GB", price: 16.50, name: "4GB", network: "mtn" },
-      { volumeInMB: 5120, volume: "5GB", price: 21.70, name: "5GB", network: "mtn" },
-      { volumeInMB: 6144, volume: "6GB", price: 24.50, name: "6GB", network: "mtn" },
-      { volumeInMB: 8192, volume: "8GB", price: 32.50, name: "8GB", network: "mtn" },
-      { volumeInMB: 10240, volume: "10GB", price: 39.00, name: "10GB", network: "mtn" },
-      { volumeInMB: 15360, volume: "15GB", price: 57.00, name: "15GB", network: "mtn" },
-      { volumeInMB: 20480, volume: "20GB", price: 77.10, name: "20GB", network: "mtn" },
-      { volumeInMB: 25600, volume: "25GB", price: 96.00, name: "25GB", network: "mtn" },
-      { volumeInMB: 30720, volume: "30GB", price: 116.00, name: "30GB", network: "mtn" },
-      { volumeInMB: 40960, volume: "40GB", price: 155.00, name: "40GB", network: "mtn" },
-      { volumeInMB: 51200, volume: "50GB", price: 186.00, name: "50GB", network: "mtn" },
-      { volumeInMB: 102400, volume: "100GB", price: 370.00, name: "100GB", network: "mtn" },
-    ],
-    telecel: [
-      { volumeInMB: 10240, volume: "10GB", price: 38.00, name: "10GB", network: "telecel" },
-      { volumeInMB: 15360, volume: "15GB", price: 55.00, name: "15GB", network: "telecel" },
-      { volumeInMB: 20480, volume: "20GB", price: 74.00, name: "20GB", network: "telecel" },
-      { volumeInMB: 25600, volume: "25GB", price: 92.00, name: "25GB", network: "telecel" },
-      { volumeInMB: 30720, volume: "30GB", price: 109.00, name: "30GB", network: "telecel" },
-      { volumeInMB: 40960, volume: "40GB", price: 143.00, name: "40GB", network: "telecel" },
-      { volumeInMB: 51200, volume: "50GB", price: 177.00, name: "50GB", network: "telecel" },
-      { volumeInMB: 102400, volume: "100GB", price: 354.00, name: "100GB", network: "telecel" },
-    ],
-    airteltigo: [
-      { volumeInMB: 1024, volume: "1GB", price: 3.90, name: "1GB", network: "airteltigo" },
-      { volumeInMB: 2048, volume: "2GB", price: 7.80, name: "2GB", network: "airteltigo" },
-      { volumeInMB: 3072, volume: "3GB", price: 11.80, name: "3GB", network: "airteltigo" },
-      { volumeInMB: 4096, volume: "4GB", price: 15.70, name: "4GB", network: "airteltigo" },
-      { volumeInMB: 5120, volume: "5GB", price: 19.40, name: "5GB", network: "airteltigo" },
-      { volumeInMB: 6144, volume: "6GB", price: 23.80, name: "6GB", network: "airteltigo" },
-      { volumeInMB: 7168, volume: "7GB", price: 27.40, name: "7GB", network: "airteltigo" },
-      { volumeInMB: 8192, volume: "8GB", price: 31.00, name: "8GB", network: "airteltigo" },
-      { volumeInMB: 9216, volume: "9GB", price: 35.00, name: "9GB", network: "airteltigo" },
-      { volumeInMB: 10240, volume: "10GB", price: 39.00, name: "10GB", network: "airteltigo" },
-      { volumeInMB: 12288, volume: "12GB", price: 47.00, name: "12GB", network: "airteltigo" },
-      { volumeInMB: 15360, volume: "15GB", price: 59.00, name: "15GB", network: "airteltigo" },
-      { volumeInMB: 20480, volume: "20GB", price: 78.50, name: "20GB", network: "airteltigo" },
-      { volumeInMB: 25600, volume: "25GB", price: 98.00, name: "25GB", network: "airteltigo" },
-    ],
-  };
+// Check price
+app.post('/api/check-price', async (req, res) => {
+  const { networkType, volumeInMB } = req.body;
+  if (!networkType || !volumeInMB) {
+    return res.status(400).json({ status: 'error', message: 'Missing required fields' });
+  }
+  try {
+    const response = await axios.post(`${REMADATA_API_URL}/get-cost-price`,
+      { networkType, volumeInMB: Number(volumeInMB) },
+      { headers: { 'X-API-KEY': REMADATA_API_KEY, 'Content-Type': 'application/json' }, timeout: 10000 }
+    );
+    res.json(response.data);
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: 'Price check failed' });
+  }
+});
 
-  if (!bundleData[network]) {
-    throw new AppError(`Unknown network "${network}"`, 400, "VALIDATION");
+// ✅ MTN KYC LOOKUP ENDPOINT - Using OAuth2
+// GET /api/kyc/lookup?phone=024XXXXXXX
+app.get('/api/kyc/lookup', async (req, res) => {
+  const { phone } = req.query;
+  
+  if (!phone) {
+    return res.status(400).json({
+      success: false,
+      error: 'Phone number is required',
+      code: 'MISSING_PHONE'
+    });
+  }
+  
+  if (!isValidMtnNumber(phone)) {
+    return res.status(400).json({
+      success: false,
+      error: `Invalid or non-MTN number. MTN numbers start with 024, 054, 055, 053, or 059`,
+      code: 'INVALID_NETWORK'
+    });
+  }
+  
+  if (!MTN_CLIENT_ID || !MTN_CLIENT_SECRET) {
+    console.error('❌ MTN OAuth2 credentials not configured');
+    return res.status(500).json({
+      success: false,
+      error: 'KYC service temporarily unavailable. Please contact support.',
+      code: 'API_NOT_CONFIGURED'
+    });
+  }
+  
+  try {
+    const result = await fetchMtnKyc(phone);
+    
+    if (!result.success) {
+      return res.status(result.statusCode || 400).json({
+        success: false,
+        error: result.error,
+        code: 'KYC_LOOKUP_FAILED'
+      });
+    }
+    
+    const kycData = result.data.data || result.data;
+    
+    const responseData = {
+      success: true,
+      data: {
+        phone: phone,
+        firstName: kycData.firstName || '',
+        lastName: kycData.lastName || '',
+        fullName: `${kycData.firstName || ''} ${kycData.lastName || ''}`.trim(),
+        idType: kycData.idType || null,
+        idNumber: kycData.idNumber || null,
+        dateOfBirth: kycData.dateOfBirth || null,
+        gender: kycData.gender || null
+      },
+      timestamp: new Date().toISOString()
+    };
+    
+    console.log(`✅ KYC data returned for ${phone}: ${responseData.data.fullName}`);
+    res.json(responseData);
+    
+  } catch (error) {
+    console.error(`❌ Unexpected error in KYC lookup for ${phone}:`, error);
+    res.status(500).json({
+      success: false,
+      error: 'An unexpected error occurred. Please try again later.',
+      code: 'INTERNAL_ERROR'
+    });
+  }
+});
+
+// Token refresh endpoint (optional, for manual refresh)
+app.post('/api/mtn/refresh-token', async (req, res) => {
+  try {
+    mtnAccessToken = null;
+    tokenExpiresAt = null;
+    const newToken = await getMtnAccessToken();
+    res.json({
+      success: true,
+      message: 'Token refreshed successfully',
+      expiresIn: Math.floor((tokenExpiresAt - Date.now()) / 1000)
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Delivery endpoint
+app.post('/deliver', requireApiKey, async (req, res) => {
+  console.log('📦 Received delivery request:', req.body);
+
+  let { phone, volumeInMB, networkType, ref } = req.body;
+
+  if (!phone || !volumeInMB || !networkType) {
+    return res.status(400).json({ status: 'error', message: 'Missing required fields: phone, volumeInMB, networkType' });
   }
 
-  let bundles = bundleData[network];
-
-  const settings = await getProfitSettings();
-  bundles = bundles.map((b) => ({
-    ...b,
-    costPrice: b.price,
-    price: applyProfit(b.price, b.volumeInMB, network, settings),
-  }));
-
-  res.json({ status: "success", data: bundles, count: bundles.length });
-}));
-
-app.post("/deliver", requireApiKey, asyncHandler(async (req, res) => {
-  const { phone, networkType, volumeInMB, ref } = req.body;
-
-  if (!phone || !networkType || !volumeInMB) {
-    throw new AppError("Missing required fields: phone, networkType, volumeInMB", 400, "VALIDATION");
+  phone = phone.replace(/\s+/g, '').replace(/-/g, '');
+  if (!/^(0|233)[0-9]{9}$/.test(phone)) {
+    return res.status(400).json({ status: 'error', message: 'Invalid phone number format' });
   }
+  if (phone.startsWith('233')) phone = '0' + phone.substring(3);
 
-  const validNetworks = Object.keys(NETWORK_PROVIDER);
-  if (!validNetworks.includes(networkType.toLowerCase())) {
-    throw new AppError(`Invalid network "${networkType}"`, 400, "VALIDATION");
+  const validNetworks = ['mtn', 'telecel', 'airteltigo'];
+  const normalizedNetwork = networkType.toLowerCase();
+  if (!validNetworks.includes(normalizedNetwork)) {
+    return res.status(400).json({ status: 'error', message: `Invalid network. Must be: ${validNetworks.join(', ')}` });
   }
 
   const volumeNum = Number(volumeInMB);
-  if (isNaN(volumeNum) || volumeNum <= 0) {
-    throw new AppError("volumeInMB must be a positive number", 400, "VALIDATION");
+  if (isNaN(volumeNum) || volumeNum <= 0 || volumeNum < 10) {
+    return res.status(400).json({ status: 'error', message: 'volumeInMB must be at least 10MB' });
   }
 
-  const result = await deliverData(phone, networkType.toLowerCase(), volumeNum, ref);
-
-  console.log(`✅ Manual delivery complete | Provider: ${result.provider}`);
-  res.json({
-    status: "success",
-    provider: result.provider,
-    reference: result.reference,
-    data: result.data,
-  });
-}));
-
-// ─────────────────────────────────────────────
-//  ORDER STATUS LOOKUP
-// ─────────────────────────────────────────────
-
-app.get("/api/order-status/:reference", asyncHandler(async (req, res) => {
-  const { reference } = req.params;
-
-  if (!reference) {
-    throw new AppError("Reference parameter is required", 400, "VALIDATION");
-  }
-
-  // Check RemaData for status
-  if (!REMADATA_API_KEY) {
-    throw new AppError("RemaData API not configured", 503, "CONFIGURATION");
-  }
-
-  console.log(`🔍 Checking RemaData status for ref: ${reference}`);
-  
   try {
-    const response = await axios.get(
-      `${REMADATA_API_URL}/order-status/${encodeURIComponent(reference)}`,
-      { headers: { "X-API-KEY": REMADATA_API_KEY }, timeout: 10000 }
-    );
-    
-    if (response.data?.status === "success") {
-      return res.json({ 
-        status: "success", 
-        provider: "RemaData", 
-        reference: reference,
-        data: response.data.data 
-      });
-    } else {
-      throw new AppError("Order not found", 404, "NOT_FOUND");
-    }
+    const result = await deliverData(phone, volumeNum, normalizedNetwork, ref || null);
+    res.json({
+      status: 'success',
+      message: 'Data delivered successfully',
+      data: result.data,
+      reference: result.remaDataRef
+    });
   } catch (err) {
-    if (err.response?.status === 404 || err.statusCode === 404) {
-      throw new AppError("Order not found", 404, "NOT_FOUND");
+    console.error(`❌ POST /deliver error:`, err.message);
+    let statusCode = err.status === 402 ? 402 : err.status === 401 ? 401 : 500;
+    let errorMessage = err.message;
+    if (err.status === 402) errorMessage = 'Insufficient wallet balance. Please top up.';
+    res.status(statusCode).json({ status: 'error', message: errorMessage });
+  }
+});
+
+// Order status
+app.get('/api/order-status/:ref', async (req, res) => {
+  const { ref } = req.params;
+
+  if (!ref) {
+    return res.status(400).json({ status: 'error', message: 'Reference is required' });
+  }
+
+  try {
+    console.log(`🔍 Checking order status for ref: ${ref}`);
+
+    const response = await axios.get(
+      `${REMADATA_API_URL}/order-status/${encodeURIComponent(ref)}`,
+      {
+        headers: { 'X-API-KEY': REMADATA_API_KEY },
+        timeout: 10000
+      }
+    );
+
+    console.log(`✅ Status for ${ref}:`, response.data?.data?.status || response.data?.status);
+    res.json(response.data);
+  } catch (err) {
+    console.error(`❌ Status check failed for ${ref}:`, err.response?.data || err.message);
+
+    if (err.response?.status === 404) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Order not found. The delivery may not have been initiated yet.'
+      });
     }
-    throw new AppError(`Failed to check order status: ${err.message}`, 502, "PROVIDER");
+
+    res.status(500).json({
+      status: 'error',
+      message: err.response?.data?.message || 'Failed to fetch order status'
+    });
   }
-}));
+});
 
-app.get("/api/profit-settings", asyncHandler(async (req, res) => {
-  const settings = await getProfitSettings();
-  res.json({ status: "success", settings });
-}));
+// Order history
+app.get('/api/orders', async (req, res) => {
+  const { page = 1, per_page = 15, status, network, phone, ref_number, start_date, end_date } = req.query;
+  const params = new URLSearchParams();
+  if (page) params.append('page', page);
+  if (per_page) params.append('per_page', per_page);
+  if (status) params.append('status', status);
+  if (network) params.append('network', network);
+  if (phone) params.append('phone', phone);
+  if (ref_number) params.append('ref_number', ref_number);
+  if (start_date) params.append('start_date', start_date);
+  if (end_date) params.append('end_date', end_date);
 
-app.post("/api/profit-settings", asyncHandler(async (req, res) => {
-  const { mode, flatAmount, percentAmount, perBundle } = req.body;
-  const validModes = ["flat", "percent", "perBundle"];
-
-  if (!validModes.includes(mode)) {
-    throw new AppError(`Invalid mode "${mode}"`, 400, "VALIDATION");
+  try {
+    const url = `${REMADATA_API_URL}/orders${params.toString() ? '?' + params.toString() : ''}`;
+    const response = await axios.get(url, {
+      headers: { 'X-API-KEY': REMADATA_API_KEY },
+      timeout: 15000
+    });
+    res.json(response.data);
+  } catch (err) {
+    console.error('Orders fetch error:', err.response?.data || err.message);
+    res.status(500).json({ status: 'error', message: 'Failed to fetch orders' });
   }
+});
 
-  const settings = {
-    mode,
-    flatAmount: parseFloat(flatAmount) || 0,
-    percentAmount: parseFloat(percentAmount) || 0,
-    perBundle: perBundle || {},
-    updatedAt: new Date().toISOString(),
-  };
-
-  if (db) {
-    try {
-      await db.ref("system/profitSettings").set(settings);
-    } catch (err) {
-      throw new AppError(`Failed to save settings: ${err.message}`, 500, "FIREBASE");
-    }
-  }
-
-  profitSettingsCache = settings;
-  lastCacheUpdate = Date.now();
-  profitSettingsPromise = null;
-
-  res.json({ status: "success", settings });
-}));
-
-// ─────────────────────────────────────────────
-//  404 HANDLER
-// ─────────────────────────────────────────────
+// 404 handler
 app.use((req, res) => {
-  res.status(404).json({ status: "error", message: `Route not found: ${req.method} ${req.url}` });
+  res.status(404).json({ status: 'error', message: `Route ${req.method} ${req.url} not found` });
 });
 
-// ─────────────────────────────────────────────
-//  ERROR HANDLER
-// ─────────────────────────────────────────────
+// Error handler
 app.use((err, req, res, next) => {
-  const isOperational = err.isOperational === true;
-  const statusCode = err.statusCode || 500;
-  const category = err.category || "INTERNAL";
-
-  if (isOperational) {
-    console.warn(`⚠️ [${category}] ${err.message}`);
-  } else {
-    console.error(`💥 [UNHANDLED] ${err.message}\n${err.stack}`);
-  }
-
-  const body = {
-    status: "error",
-    category,
-    message: isOperational ? err.message : "Internal server error",
-  };
-
-  if (err.details && process.env.NODE_ENV !== "production") {
-    body.details = err.details;
-  }
-
-  res.status(statusCode).json(body);
-});
-
-// ─────────────────────────────────────────────
-//  GRACEFUL SHUTDOWN
-// ─────────────────────────────────────────────
-
-process.on("SIGTERM", async () => {
-  console.log("🛑 SIGTERM received, starting graceful shutdown...");
-  
-  if (failedSaveQueue.length > 0) {
-    console.log(`📦 Processing ${failedSaveQueue.length} queued saves before shutdown...`);
-    await processFailedSaveQueue();
-  }
-  
-  console.log("✅ Graceful shutdown complete");
-  process.exit(0);
-});
-
-process.on("SIGINT", async () => {
-  console.log("🛑 SIGINT received, shutting down...");
-  process.exit(0);
+  console.error('💥 Server error:', err.stack);
+  res.status(500).json({ status: 'error', message: 'Internal server error' });
 });
 
 // ─────────────────────────────────────────────
 //  START SERVER
 // ─────────────────────────────────────────────
-
-validateEnv();
-
 app.listen(PORT, () => {
-  const col = (label, ok) => `  ${label.padEnd(28)} ${ok ? "✅" : "❌"}`;
   console.log(`
-╔══════════════════════════════════════════════════════════════╗
-║   🚀  DataFlow GH Backend — Production Ready                 ║
-║   📡  Port: ${String(PORT).padEnd(37)}║
-╠══════════════════════════════════════════════════════════════╣
-${col("║  MTN → RemaData", !!REMADATA_API_KEY)}        ║
-${col("║  Telecel → RemaData", !!REMADATA_API_KEY)}        ║
-${col("║  AirtelTigo → RemaData", !!REMADATA_API_KEY)}        ║
-${col("║  Paystack Webhook", !!PAYSTACK_SECRET)}        ║
-${col("║  /deliver Auth", !!DELIVER_SECRET)}        ║
-${col("║  Firebase", !!db)}        ║
-╠══════════════════════════════════════════════════════════════╣
-║  Features:                                                  ║
-║  • Retry logic (${MAX_RETRIES}x exponential backoff)                   ║
-║  • All networks via RemaData                               ║
-║  • Memory protection (${MAX_REF_SIZE} max refs)                        ║
-║  • Firebase queue (${failedSaveQueue.length} pending)                    ║
-║  • Customer-friendly error messages                        ║
-╚══════════════════════════════════════════════════════════════╝`);
+╔══════════════════════════════════════════════════════════════════════════════╗
+║   🚀 DataFlow Backend Server Running                                          ║
+║   📡 Port: ${PORT}                                                              ║
+║   🌐 URL:  ${SELF_URL}                                                         ║
+║   🔑 RemaData API: ${REMADATA_API_KEY ? '✅ Configured' : '❌ NOT SET'}                            ║
+║   💳 Paystack:     ${PAYSTACK_SECRET  ? '✅ Configured' : '❌ NOT SET'}                              ║
+║   🔒 /deliver key: ${DELIVER_SECRET   ? '✅ Configured' : '❌ NOT SET'}                              ║
+║   📞 MTN KYC API:  ${(MTN_CLIENT_ID && MTN_CLIENT_SECRET) ? '✅ OAuth2 Configured' : '❌ NOT SET'}   ║
+║                                                                                ║
+║   📮 Endpoints:                                                                ║
+║      POST /deliver                → Manual delivery 🔒                         ║
+║      GET  /api/balance            → Wallet balance                             ║
+║      GET  /api/order-status/:ref  → Order status ✓                             ║
+║      POST /paystack-webhook       → Payment webhook                            ║
+║      GET  /api/bundles            → Available bundles                          ║
+║      GET  /api/orders             → Order history                              ║
+║      GET  /api/kyc/lookup         → MTN SIM registration name lookup (OAuth2) ✓║
+║      POST /api/mtn/refresh-token  → Manually refresh MTN token                 ║
+║      GET  /health                 → Health check                               ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+  `);
 });
 
-// Keep-alive for Render free tier
-if (process.env.NODE_ENV === "production") {
+// Keep-alive ping for production
+if (process.env.NODE_ENV === 'production') {
   setInterval(async () => {
     try {
-      await axios.get(`http://localhost:${PORT}/health`, { timeout: 10000 });
+      await axios.get(`${SELF_URL}/health`, { timeout: 10000 });
+      console.log(`💓 Keep-alive ping - ${new Date().toISOString()}`);
     } catch (err) {
-      console.error(`⚠️ Keep-alive failed: ${err.message}`);
+      console.error(`⚠️ Keep-alive ping failed:`, err.message);
     }
   }, 4 * 60 * 1000);
+  
+  // Also refresh MTN token periodically
+  setInterval(async () => {
+    try {
+      await axios.post(`${SELF_URL}/api/mtn/refresh-token`, {}, { timeout: 10000 });
+      console.log(`🔄 MTN token auto-refreshed - ${new Date().toISOString()}`);
+    } catch (err) {
+      console.error(`⚠️ MTN token refresh failed:`, err.message);
+    }
+  }, 50 * 60 * 1000); // Refresh every 50 minutes
 }
 
 module.exports = app;
